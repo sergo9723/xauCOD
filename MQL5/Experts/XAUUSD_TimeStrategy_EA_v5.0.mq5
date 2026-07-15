@@ -219,6 +219,16 @@ void PersistCircuitBreaker()
    GlobalVariableSet(GVName("Paused"), g_trading_paused ? 1.0 : 0.0);
 }
 
+// Найдено на аудите: без этого суточный лимит InpMaxTradesPerDay сбрасывался
+// в 0 при любом перезапуске EA (смена параметра, перезапуск терминала) в
+// середине дня — можно было превысить лимит сделок за календарный день.
+// Персистентно, как и стоп-машина.
+void PersistDailyState()
+{
+   GlobalVariableSet(GVName("TradesToday"), (double)g_trades_today);
+   GlobalVariableSet(GVName("LastDay"), (double)g_last_day);
+}
+
 // Под-magic для направления: SHORT = база+0, LONG = база+1.
 // Заменяет WindowMagic(w) из v4.9 — окон-подокон больше нет.
 int DirectionMagic(int direction)
@@ -822,6 +832,25 @@ int OnInit()
       g_trading_paused = (GlobalVariableGet(GVName("Paused")) != 0.0);
    if(GlobalVariableCheck(GVName("ConsecLosses")))
       g_consecutive_losses = (int)GlobalVariableGet(GVName("ConsecLosses"));
+
+   // Восстанавливаем суточный лимит сделок, только если сохранённый "последний
+   // день" — СЕГОДНЯ (иначе это старое значение от прошлого дня, законно 0).
+   if(GlobalVariableCheck(GVName("LastDay")) && GlobalVariableCheck(GVName("TradesToday")))
+   {
+      datetime savedDay = (datetime)GlobalVariableGet(GVName("LastDay"));
+      MqlDateTime nowDt;
+      TimeToStruct(TimeCurrent(), nowDt);
+      datetime todayNow = StringToTime(
+         StringFormat("%04d.%02d.%02d 00:00", nowDt.year, nowDt.mon, nowDt.day));
+      if(savedDay == todayNow)
+      {
+         g_last_day = savedDay;
+         g_trades_today = (int)GlobalVariableGet(GVName("TradesToday"));
+         if(g_trades_today > 0)
+            Print("🔁 Восстановлено число сделок за сегодня после перезапуска: ", g_trades_today,
+                  "/", InpMaxTradesPerDay);
+      }
+   }
    if(g_trading_paused)
       Print("🔁 Восстановлено состояние стоп-машины после перезапуска: ПАУЗА (",
             g_consecutive_losses, " убытков подряд)");
@@ -874,6 +903,8 @@ void OnDeinit(const int reason)
    {
       GlobalVariableDel(GVName("ConsecLosses"));
       GlobalVariableDel(GVName("Paused"));
+      GlobalVariableDel(GVName("TradesToday"));
+      GlobalVariableDel(GVName("LastDay"));
    }
 
    Print("════════════════════════════════════════════");
@@ -919,6 +950,7 @@ void OnTick()
       g_short_confirm = 0;
       g_long_confirm = 0;
       g_last_day = todayStart;
+      PersistDailyState();
       Print("🌅 Новый день: ", TimeToString(todayStart, TIME_DATE));
 
       if(dt.day_of_week == 1 && g_trading_paused)
@@ -933,6 +965,14 @@ void OnTick()
    datetime curBarTime = iTime(_Symbol, PERIOD_M15, 0);
    bool isNewBar = (curBarTime != g_last_bar_time);
 
+   // ВАЖНО: попытка входа делается ТОЛЬКО раз за бар (внутри isNewBar), а не на
+   // каждом тике. Раньше (до аудита) проверка входа шла в OnTick() отдельно от
+   // isNewBar — если OpenPosition() не срабатывал (реквот, "торговый контекст
+   // занят", временная нехватка маржи), EA пытался открыть сделку ПОВТОРНО на
+   // КАЖДОМ следующем тике того же бара (а тиков может быть десятки в секунду),
+   // без какой-либо паузы между попытками — риск завалить сервер брокера
+   // повторными запросами и захламить журнал одинаковыми ошибками. Теперь одна
+   // попытка на бар, следующая — только на следующем новом баре.
    if(isNewBar)
    {
       g_last_bar_time = curBarTime;
@@ -944,50 +984,56 @@ void OnTick()
       g_short_score = CountFilters(-1, lookbackPrice, g_short_detail);
       g_long_score  = CountFilters(1,  lookbackPrice, g_long_detail);
 
-      if(g_regime_ok && g_short_score >= InpMinScore) g_short_confirm++;
-      else g_short_confirm = 0;
+      if(g_regime_ok && g_short_score >= InpMinScore)
+         g_short_confirm = MathMin(g_short_confirm + 1, InpConfirmBars);
+      else
+         g_short_confirm = 0;
 
-      if(g_regime_ok && g_long_score >= InpMinScore) g_long_confirm++;
-      else g_long_confirm = 0;
-   }
+      if(g_regime_ok && g_long_score >= InpMinScore)
+         g_long_confirm = MathMin(g_long_confirm + 1, InpConfirmBars);
+      else
+         g_long_confirm = 0;
 
-   // ---------- Проверка возможности входа (общие условия) ----------
-   bool canTradeNow = true;
-   if(g_trading_paused) canTradeNow = false;
-   if(g_trades_today >= InpMaxTradesPerDay) canTradeNow = false;
-   if(InpCooldownMinutes > 0 && g_last_trade_time != 0 &&
-      (serverTime - g_last_trade_time) < (long)InpCooldownMinutes * 60) canTradeNow = false;
+      // ---------- Проверка возможности входа (общие условия) ----------
+      bool canTradeNow = true;
+      if(g_trading_paused) canTradeNow = false;
+      if(g_trades_today >= InpMaxTradesPerDay) canTradeNow = false;
+      if(InpCooldownMinutes > 0 && g_last_trade_time != 0 &&
+         (serverTime - g_last_trade_time) < (long)InpCooldownMinutes * 60) canTradeNow = false;
 
-   if(canTradeNow)
-   {
-      // ---------- SHORT ----------
-      if(g_short_confirm >= InpConfirmBars && !HasOpenPositionForDirection(-1))
+      if(canTradeNow)
       {
-         if(SpreadOK() && CalendarClear())
+         // ---------- SHORT ----------
+         if(g_short_confirm >= InpConfirmBars && !HasOpenPositionForDirection(-1))
          {
-            if(OpenPosition(-1, DirectionMagic(-1)))
+            if(SpreadOK() && CalendarClear())
             {
-               g_short_confirm = 0;
-               g_trades_today++;
-               g_last_trade_time = serverTime;
-               g_total_trades++;
-               g_short_count++;
+               if(OpenPosition(-1, DirectionMagic(-1)))
+               {
+                  g_short_confirm = 0;
+                  g_trades_today++;
+                  PersistDailyState();
+                  g_last_trade_time = serverTime;
+                  g_total_trades++;
+                  g_short_count++;
+               }
             }
          }
-      }
 
-      // ---------- LONG ----------
-      if(g_long_confirm >= InpConfirmBars && !HasOpenPositionForDirection(1))
-      {
-         if(SpreadOK() && CalendarClear())
+         // ---------- LONG ----------
+         if(g_long_confirm >= InpConfirmBars && !HasOpenPositionForDirection(1))
          {
-            if(OpenPosition(1, DirectionMagic(1)))
+            if(SpreadOK() && CalendarClear())
             {
-               g_long_confirm = 0;
-               g_trades_today++;
-               g_last_trade_time = serverTime;
-               g_total_trades++;
-               g_long_count++;
+               if(OpenPosition(1, DirectionMagic(1)))
+               {
+                  g_long_confirm = 0;
+                  g_trades_today++;
+                  PersistDailyState();
+                  g_last_trade_time = serverTime;
+                  g_total_trades++;
+                  g_long_count++;
+               }
             }
          }
       }
