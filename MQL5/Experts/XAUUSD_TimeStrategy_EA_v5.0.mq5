@@ -31,9 +31,9 @@
 //|  • TP/SL теперь плавающие, считаются от ATR и ограничены          |
 //|    коридором InpMinTPPts..InpMaxTPPts (по умолчанию 50-1000 пт —  |
 //|    ваше "50 до 500-1000 пунктов").                                |
-//|  • Быстрая защита прибыли: безубыток теперь срабатывает уже на    |
-//|    +50 пт (было +300 в v4.9) — реализация вашего "не давать       |
-//|    упасть ниже +50, если цена резко разворачивается".             |
+//|  • Быстрая защита прибыли — реализация вашего "не давать упасть   |
+//|    ниже +50, если цена резко разворачивается" (см. ниже фикс от   |
+//|    реального теста: пороги теперь % от TP, а не фикс. пункты).    |
 //|  • Лимит сделок в день (InpMaxTradesPerDay) и кулдаун между        |
 //|    сделками (InpCooldownMinutes) — чтобы не открывать сделки      |
 //|    слишком часто на одном и том же движении.                      |
@@ -62,6 +62,21 @@
 //|  объёма (с фиксом реверса массива), риск % от баланса, частичное  |
 //|  закрытие, трейлинг, проверка hedging-счёта, персистентная        |
 //|  стоп-машина после серии убытков.                                 |
+//|                                                                  |
+//|  НАЙДЕНО НА РЕАЛЬНОМ ТЕСТЕ В MT5 (лог 2026.06.01-07.16, старт     |
+//|  $1000, лот 0.1): 32 сделки, 25 побед/7 убытков (винрейт 78.1%),  |
+//|  но итог -$782.55 (баланс $1000→$217). Причина: безубыток (+50пт) |
+//|  и трейлинг (+60пт старт) были откалиброваны под МАЛЕНЬКИЙ TP, а  |
+//|  не под реальный плавающий TP по ATR (часто ~900-1000 пт). Итог:  |
+//|  все 25 побед закрывались в среднем на $24.96 (макс $69.40), ни   |
+//|  разу не дойдя до полного TP (~$100-120), а все 7 убытков доходили|
+//|  почти ровно до полного SL (~$200.93). Реальное соотношение       |
+//|  прибыль/убыток получилось ~1:8 вместо задуманного 1:2 — при      |
+//|  винрейте 78.1% нужно было ≥89%, чтобы не уйти в минус.           |
+//|  ИСПРАВЛЕНО: безубыток/частичное закрытие/трейлинг теперь считают |
+//|  пороги как % от РЕАЛЬНОЙ дистанции TP этой сделки (не фикс.      |
+//|  пункты) — защита масштабируется вместе с плавающей целью, а не   |
+//|  режет прибыль в зародыше при большом TP.                         |
 //+------------------------------------------------------------------+
 #property copyright   "Custom EA v5.0 CONTINUOUS SCAN — новая гипотеза, требует проверки в тестере"
 #property version     "5.00"
@@ -97,16 +112,26 @@ input int     InpMaxTPPts         = 1000;    // верхняя граница TP
 input int     InpMinSLPts         = 250;
 input int     InpMaxSLPts         = 2000;
 
-input group "=== УПРАВЛЕНИЕ ОТКРЫТОЙ ПОЗИЦИЕЙ (быстрая защита прибыли) ==="
-input bool    InpUseBreakEven        = true;
-input int     InpBreakEvenTriggerPts = 50;   // профит в пунктах для переноса SL в БУ (было 300 в v4.9)
-input int     InpBreakEvenLockPts    = 40;   // сколько пунктов профита фиксируем ("не ниже +50")
-input bool    InpUsePartialClose     = true;
-input double  InpPartialClosePct     = 50.0; // % объёма закрыть частично
-input double  InpPartialCloseAtTPPct = 60.0; // на скольки % от TP делать частичное закрытие
-input bool    InpUseTrailingStop     = true;
-input int     InpTrailingStartPts    = 60;   // профит для начала трейлинга (после безубытка)
-input int     InpTrailingStepPts     = 30;   // дистанция трейлинга от текущей цены
+input group "=== УПРАВЛЕНИЕ ОТКРЫТОЙ ПОЗИЦИЕЙ (защита прибыли, % от TP сделки) ==="
+// НАЙДЕНО НА РЕАЛЬНОМ ТЕСТЕ (лог 2026.06.01-07.16): фиксированные пороги
+// +50/+60 пт были откалиброваны под МАЛЕНЬКИЙ TP, а не под реальный
+// плавающий TP по ATR (часто ~900-1000 пт). Итог: 25/25 побед закрывались
+// в среднем на $24.96 (макс $69.40), ни разу не дойдя до полного TP
+// (~$100-120), а все 7 убытков доходили почти ровно до полного SL
+// (~$200.93). Реальное соотношение прибыль/убыток получилось ~1:8 вместо
+// задуманного 1:2 — при винрейте 78.1% это дало -$782.55 на $1000.
+// Исправлено: пороги теперь % от РЕАЛЬНОЙ дистанции TP этой сделки
+// (curTP-openPrice), а не фиксированные пункты — масштабируются вместе
+// с плавающей целью.
+input bool    InpUseBreakEven          = true;
+input double  InpBreakEvenAtTPPct      = 25.0;  // профит (% от TP сделки) для переноса SL в БУ
+input double  InpBreakEvenLockAtTPPct  = 8.0;   // сколько % от TP фиксируем в безубытке
+input bool    InpUsePartialClose       = true;
+input double  InpPartialClosePct       = 50.0;  // % объёма закрыть частично
+input double  InpPartialCloseAtTPPct   = 60.0;  // на скольки % от TP делать частичное закрытие
+input bool    InpUseTrailingStop       = true;
+input double  InpTrailingStartAtTPPct  = 70.0;  // профит (% от TP) для начала трейлинга
+input double  InpTrailingStepAtTPPct   = 15.0;  // дистанция трейлинга (% от TP) от текущей цены
 
 input group "=== ЗАЩИТА КАПИТАЛА ==="
 input int     InpMaxConsecutiveLosses = 3;   // 0 = отключено; пауза до понедельника
@@ -605,11 +630,17 @@ void ManageOpenPositions()
 
       int mIdx = GetOrCreateMgmt(posId);
 
+      // tpDist = реальная дистанция TP ЭТОЙ сделки (в пунктах), а не общий
+      // фиксированный вход. Все три порога защиты (безубыток/частичное
+      // закрытие/трейлинг) масштабируются от неё — при плавающем TP по ATR
+      // цель может быть и 60 пт, и 950 пт, порог должен следовать за ней.
+      double tpDist = (curTP != 0.0) ? MathAbs(curTP - openPrice) / point : InpTakeProfit;
+
       // --- Безубыток ---
       if(InpUseBreakEven && !g_posMgmt[mIdx].beDone &&
-         profitPts >= InpBreakEvenTriggerPts)
+         profitPts >= tpDist * (InpBreakEvenAtTPPct / 100.0))
       {
-         int lockPts = MathMax(InpBreakEvenLockPts, minStop);
+         int lockPts = MathMax((int)MathRound(tpDist * (InpBreakEvenLockAtTPPct / 100.0)), minStop);
          double newSL = (type == POSITION_TYPE_BUY)
                          ? NormalizeDouble(openPrice + lockPts * point, digits)
                          : NormalizeDouble(openPrice - lockPts * point, digits);
@@ -634,7 +665,6 @@ void ManageOpenPositions()
       // --- Частичное закрытие ---
       if(InpUsePartialClose && !g_posMgmt[mIdx].partialDone)
       {
-         double tpDist = (curTP != 0.0) ? MathAbs(curTP - openPrice) / point : InpTakeProfit;
          double target = tpDist * (InpPartialCloseAtTPPct / 100.0);
 
          if(profitPts >= target)
@@ -664,9 +694,9 @@ void ManageOpenPositions()
 
       // --- Трейлинг-стоп (только после безубытка) ---
       if(InpUseTrailingStop && g_posMgmt[mIdx].beDone &&
-         profitPts >= InpTrailingStartPts)
+         profitPts >= tpDist * (InpTrailingStartAtTPPct / 100.0))
       {
-         int stepPts = MathMax(InpTrailingStepPts, minStop);
+         int stepPts = MathMax((int)MathRound(tpDist * (InpTrailingStepAtTPPct / 100.0)), minStop);
          if(type == POSITION_TYPE_BUY)
          {
             double newSL = NormalizeDouble(bid - stepPts * point, digits);
@@ -767,22 +797,31 @@ int OnInit()
    }
    if(InpUseBreakEven)
    {
-      if(InpBreakEvenTriggerPts <= 0 || InpBreakEvenLockPts <= 0)
+      if(InpBreakEvenAtTPPct <= 0.0 || InpBreakEvenLockAtTPPct <= 0.0)
       {
-         Print("❌ ERROR: InpBreakEvenTriggerPts и InpBreakEvenLockPts должны быть > 0");
+         Print("❌ ERROR: InpBreakEvenAtTPPct и InpBreakEvenLockAtTPPct должны быть > 0");
          return INIT_PARAMETERS_INCORRECT;
       }
-      if(InpBreakEvenLockPts >= InpBreakEvenTriggerPts)
+      if(InpBreakEvenLockAtTPPct >= InpBreakEvenAtTPPct)
       {
-         Print("❌ ERROR: InpBreakEvenLockPts должен быть МЕНЬШЕ InpBreakEvenTriggerPts ",
+         Print("❌ ERROR: InpBreakEvenLockAtTPPct должен быть МЕНЬШЕ InpBreakEvenAtTPPct ",
                "(иначе SL попытается встать за пределы текущей цены)");
          return INIT_PARAMETERS_INCORRECT;
       }
    }
-   if(InpUseTrailingStop && (InpTrailingStartPts <= 0 || InpTrailingStepPts <= 0))
+   if(InpUseTrailingStop)
    {
-      Print("❌ ERROR: InpTrailingStartPts и InpTrailingStepPts должны быть > 0");
-      return INIT_PARAMETERS_INCORRECT;
+      if(InpTrailingStartAtTPPct <= 0.0 || InpTrailingStepAtTPPct <= 0.0)
+      {
+         Print("❌ ERROR: InpTrailingStartAtTPPct и InpTrailingStepAtTPPct должны быть > 0");
+         return INIT_PARAMETERS_INCORRECT;
+      }
+      if(InpUseBreakEven && InpTrailingStartAtTPPct < InpBreakEvenAtTPPct)
+      {
+         Print("❌ ERROR: InpTrailingStartAtTPPct должен быть ≥ InpBreakEvenAtTPPct ",
+               "(трейлинг стартует после безубытка)");
+         return INIT_PARAMETERS_INCORRECT;
+      }
    }
 
    ENUM_ACCOUNT_MARGIN_MODE marginMode =
@@ -873,9 +912,9 @@ int OnInit()
             InpMinSLPts, "-", InpMaxSLPts, "] пт");
    else
       Print("TP/SL: фиксированные ", InpTakeProfit, "/", InpStopLoss, " пт");
-   Print("Безубыток от +", InpBreakEvenTriggerPts, "пт (фикс +", InpBreakEvenLockPts,
-         ") | Частичное закрытие: ", (InpUsePartialClose ? "ON" : "OFF"),
-         " | Трейлинг: ", (InpUseTrailingStop ? "ON" : "OFF"));
+   Print("Безубыток от ", InpBreakEvenAtTPPct, "% TP (фикс ", InpBreakEvenLockAtTPPct,
+         "% TP) | Частичное закрытие: ", (InpUsePartialClose ? "ON" : "OFF"),
+         " | Трейлинг от ", InpTrailingStartAtTPPct, "% TP: ", (InpUseTrailingStop ? "ON" : "OFF"));
    Print("Лимит сделок/день: ", InpMaxTradesPerDay, " | Кулдаун между сделками: ",
          InpCooldownMinutes, " мин");
    Print("Стоп-машина после ", InpMaxConsecutiveLosses, " убытков подряд (на весь EA сразу)");
