@@ -118,6 +118,15 @@ input int     InpSessionWindowMinutes = 900; // сколько минут пос
 input bool    InpSkipFirstCandle    = true; // не входить на первой M5-свече после открытия окна
 input int     InpMAPeriod           = 50;   // период индикатора "Импульс" (обычная MA)
 input ENUM_MA_METHOD InpMAMethod    = MODE_SMA;
+// НАЙДЕНО (реальный прогон): "рынок падает, шорт, немного поднялось — сразу
+// пишет лонг, потом снова падает — снова шорт". Причина: MA-фильтр сравнивал
+// цену с MA БЕЗ буфера и без проверки наклона самой MA — любой мелкий отскок
+// на пару пунктов через линию MA тут же переключал показанное направление,
+// хотя реального разворота тренда не было. Добавлены буфер (цена должна
+// отойти от MA на ощутимое расстояние, не просто пересечь линию) и проверка
+// наклона MA (сама средняя должна расти/падать, а не быть плоской).
+input double  InpMABufferPts        = 50;   // мин. расстояние цены от MA, чтобы засчитать направление (было 0)
+input int     InpMASlopeBars        = 5;    // на скольки барах назад сравниваем MA для определения наклона
 
 input group "=== ШАГ 3-4: ЗОНЫ НА M5 + ПРОБОЙ С ПОДТВЕРЖДЁННЫМ ЗАКРЫТИЕМ ==="
 input int     InpLtfPivotLegBars    = 2;
@@ -970,6 +979,11 @@ int OnInit()
       Print("❌ ERROR: InpSwingConfirmCount должен быть ≥ 2 (нужно минимум 2 свинга для направления)");
       return INIT_PARAMETERS_INCORRECT;
    }
+   if(InpMABufferPts < 0.0 || InpMASlopeBars <= 0)
+   {
+      Print("❌ ERROR: InpMABufferPts должен быть ≥ 0, InpMASlopeBars должен быть > 0");
+      return INIT_PARAMETERS_INCORRECT;
+   }
    if(InpSessionStartHour < 0 || InpSessionStartHour > 23 || InpSessionStartMinute < 0 || InpSessionStartMinute > 59)
    {
       Print("❌ ERROR: InpSessionStartHour/Minute вне диапазона");
@@ -1055,7 +1069,8 @@ int OnInit()
          " кластер=", InpH4ZoneClusterPts, "пт мин.касаний=", InpH4MinTouches, ")");
    Print("Шаг 2: сессия ", StringFormat("%02d:%02d", InpSessionStartHour, InpSessionStartMinute),
          " + ", InpSessionWindowMinutes, " мин, пропуск первой свечи: ", (InpSkipFirstCandle?"ON":"OFF"),
-         ", MA(", InpMAPeriod, ") как фильтр направления");
+         ", MA(", InpMAPeriod, ") с буфером ", InpMABufferPts, "пт и наклоном за ", InpMASlopeBars,
+         " баров как фильтр направления");
    Print("Шаг 3-4: M5 зоны (leg=", InpLtfPivotLegBars, " lookback=", InpLtfLookbackBars,
          " кластер=", InpLtfZoneClusterPts, "пт) — вход по подтверждённому закрытию за зоной");
    Print("SL буфер: ", InpSLBufferPts, "пт | TP на ", InpTPAtOppositeZonePct, "% пути до противоположной зоны");
@@ -1167,9 +1182,25 @@ void OnTick()
       g_nearResistance = false;
    }
 
-   double ma = BufferVal(h_ma, 0, 1);
-   g_maLong  = (ma != EMPTY_VALUE) && (curPrice > ma);
-   g_maShort = (ma != EMPTY_VALUE) && (curPrice < ma);
+   // Буфер + наклон (см. пояснение у InpMABufferPts выше) — без этого мелкий
+   // отскок цены через линию MA на пару пунктов мгновенно переключал
+   // показанное направление туда-обратно ("рынок падает — шорт, чуть
+   // поднялось — сразу лонг, снова падает — снова шорт").
+   double maNow  = BufferVal(h_ma, 0, 1);
+   double maPrev = BufferVal(h_ma, 0, 1 + InpMASlopeBars);
+   if(maNow != EMPTY_VALUE && maPrev != EMPTY_VALUE)
+   {
+      double buffer = InpMABufferPts * point;
+      bool maRising  = maNow > maPrev;
+      bool maFalling = maNow < maPrev;
+      g_maLong  = (curPrice > maNow + buffer) && maRising;
+      g_maShort = (curPrice < maNow - buffer) && maFalling;
+   }
+   else
+   {
+      g_maLong = false;
+      g_maShort = false;
+   }
 
    g_inSession = InSessionWindow();
 
