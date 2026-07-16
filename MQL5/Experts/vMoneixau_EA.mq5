@@ -161,6 +161,10 @@ struct SRZone
    double hi;
    int    touches;
    bool   isResistance;
+   double anchor;  // цена ПЕРВОГО свинга, создавшего зону — новые касания
+                    // сравниваются с ней, а не с текущим (уже расширенным)
+                    // центром, иначе зона может "расползтись" на всю историю
+                    // при медленном дрейфе цены (см. ClusterZones).
 };
 
 SwingPoint g_h4Swings[];
@@ -437,6 +441,16 @@ void DetectSwings(ENUM_TIMEFRAMES tf, int legBars, int lookbackBars, SwingPoint 
 //| Кластеризация свингов в зоны поддержки/сопротивления              |
 //| (касания в пределах clusterPts считаем одной и той же зоной,      |
 //| зона = от тела свечи до тени, как вы описали).                   |
+//|                                                                  |
+//| ВАЖНО: новое касание сравнивается с ANCHOR (цена первого свинга,  |
+//| создавшего зону), а НЕ с текущим центром зоны. Раньше сравнение   |
+//| шло с центром, который сам сдвигается при каждом расширении зоны |
+//| — из-за этого при медленном дрейфе цены (серия свингов, каждый   |
+//| чуть дальше предыдущего) зона могла "расползаться" бесконечно,    |
+//| склеивая на самом деле РАЗНЫЕ уровни в одну гигантскую зону и     |
+//| ломая определение диапазона (и, соответственно, направления      |
+//| сделок — зона резистанса могла случайно "дорасти" почти до зоны   |
+//| поддержки).                                                       |
 //+------------------------------------------------------------------+
 void ClusterZones(SwingPoint &swings[], double clusterPts, int minTouches, SRZone &zones[])
 {
@@ -450,8 +464,7 @@ void ClusterZones(SwingPoint &swings[], double clusterPts, int minTouches, SRZon
       for(int z = 0; z < ArraySize(zones); z++)
       {
          if(zones[z].isResistance != swings[i].isHigh) continue;
-         double zoneCenter = (zones[z].lo + zones[z].hi) / 2.0;
-         if(MathAbs(swings[i].price - zoneCenter) <= clusterDist)
+         if(MathAbs(swings[i].price - zones[z].anchor) <= clusterDist)
          {
             if(swings[i].isHigh)
             {
@@ -472,6 +485,7 @@ void ClusterZones(SwingPoint &swings[], double clusterPts, int minTouches, SRZon
       {
          int n = ArraySize(zones);
          ArrayResize(zones, n + 1);
+         zones[n].anchor = swings[i].price;
          if(swings[i].isHigh)
          {
             zones[n].hi = swings[i].price;
@@ -523,13 +537,29 @@ bool GetActiveRange(SRZone &zones[], double curPrice, SRZone &resOut, SRZone &su
 //+------------------------------------------------------------------+
 //| Структура свингов: HH+HL -> +1 (аптренд, только лонг разрешён),   |
 //| LH+LL -> -1 (даунтренд, только шорт), иначе 0 (нет подтверждения) |
+//|                                                                  |
+//| ВАЖНО: раньше свинг-хаи и свинг-лоу собирались НЕЗАВИСИМО, каждый |
+//| до накопления confirmCount штук, без ограничения по тому, как     |
+//| далеко назад пришлось заглянуть. Если, например, свинг-хаи        |
+//| попадались редко, а свинг-лоу часто, могло получиться сравнение    |
+//| хаёв недельной давности со свежими вчерашними лоу — структура     |
+//| "аптренд/даунтренд" получалась бы из ДВУХ РАЗНЫХ, несвязанных по   |
+//| времени участков графика, а не из реальной недавней структуры.    |
+//| Теперь окно поиска ограничено (последние ~6×confirmCount свингов  |
+//| ЛЮБОГО типа) — если внутри него не набралось confirmCount хаёв И   |
+//| confirmCount лоу, считаем "нет подтверждения" вместо того чтобы    |
+//| лезть произвольно далеко в историю.                                |
 //+------------------------------------------------------------------+
 int GetSwingTrendBias(SwingPoint &swings[], int confirmCount)
 {
    double highs[]; double lows[];
    ArrayResize(highs, 0); ArrayResize(lows, 0);
 
-   for(int i = ArraySize(swings) - 1; i >= 0; i--)
+   int total = ArraySize(swings);
+   int windowLimit = confirmCount * 6;
+   int scanned = 0;
+
+   for(int i = total - 1; i >= 0 && scanned < windowLimit; i--, scanned++)
    {
       if(swings[i].isHigh && ArraySize(highs) < confirmCount)
       {
