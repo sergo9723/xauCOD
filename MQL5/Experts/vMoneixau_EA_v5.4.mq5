@@ -20,6 +20,14 @@
 //|  произошёл. Это и есть "определять направление рынка и открывать   |
 //|  позицию ПО направлению рынка", а не против недавнего импульса,    |
 //|  который ещё не развернулся.                                       |
+//|                                                                  |
+//|  ОБНОВЛЕНО (после нескольких реальных прогонов подряд без единой  |
+//|  сделки): панель теперь показывает ЖИВОЙ ЧЕК-ЛИСТ — какое именно  |
+//|  из условий (диапазон найден / ширина ОК / у зоны / MA / сессия)  |
+//|  сейчас не выполнено, вместо того чтобы гадать по скриншотам.      |
+//|  Также ослаблены пороги, которые по накопленным данным оказались   |
+//|  главным узким местом: InpZoneProximityPts 400→700,               |
+//|  InpMaxRangeWidthPts 3000→5000, InpSessionWindowMinutes 600→900.  |
 //+------------------------------------------------------------------+
 //|  Новая, отдельная стратегия (не связана с XAUUSD_TimeStrategy_EA  |
 //|  v4.x/v5.x) — реализация методики, которую вы описали текстом, в  |
@@ -99,14 +107,14 @@ input int     InpH4PivotLegBars     = 3;    // баров слева/справ�
 input int     InpH4LookbackBars     = 150;  // сколько H4-баров назад искать зоны (~25 дней)
 input double  InpH4ZoneClusterPts   = 300;  // касания в пределах этого расстояния — одна зона
 input int     InpH4MinTouches       = 2;    // мин. касаний, чтобы зона считалась подтверждённой
-input double  InpZoneProximityPts   = 400;  // насколько близко цена должна быть к H4-зоне (было 150)
-input double  InpMaxRangeWidthPts   = 3000; // макс. ширина H4-диапазона — иначе это не реальный боковик
+input double  InpZoneProximityPts   = 700;  // насколько близко цена должна быть к H4-зоне (было 150→400)
+input double  InpMaxRangeWidthPts   = 5000; // макс. ширина H4-диапазона — иначе это не реальный боковик (было 3000)
 input int     InpSwingConfirmCount  = 2;    // сколько последних свинг-хаев/лоу проверяем на направление
 
 input group "=== ШАГ 2: СЕССИЯ И ИНДИКАТОР 'ИМПУЛЬС' ==="
 input int     InpSessionStartHour   = 16;   // начало торгового окна (время сервера — настройте под NY-открытие у вашего брокера)
 input int     InpSessionStartMinute = 30;
-input int     InpSessionWindowMinutes = 600; // сколько минут после старта окна ищем сделки (было 240)
+input int     InpSessionWindowMinutes = 900; // сколько минут после старта окна ищем сделки (было 240→600)
 input bool    InpSkipFirstCandle    = true; // не входить на первой M5-свече после открытия окна
 input int     InpMAPeriod           = 50;   // период индикатора "Импульс" (обычная MA)
 input ENUM_MA_METHOD InpMAMethod    = MODE_SMA;
@@ -221,12 +229,17 @@ bool     g_trading_paused     = false;
 ENUM_ORDER_TYPE_FILLING g_fillType = ORDER_FILLING_IOC;
 string PANEL_PREFIX = "vMoneixau_";
 
-// Живой статус для панели
-bool     g_haveRange   = false;
+// Живой статус для панели — единый источник правды: считается один раз в
+// OnTick и используется И для решения о входе (CheckEntry), И для панели
+// (DrawPanel), чтобы не гадать, что именно блокирует вход — панель теперь
+// показывает результат КАЖДОГО шага живьём.
+bool     g_haveRange    = false;
+bool     g_rangeWidthOk = false;
 SRZone   g_curRes, g_curSup;
 int      g_swingBias   = 0;
 bool     g_maLong = false, g_maShort = false;
 bool     g_inSession = false;
+bool     g_nearSupport = false, g_nearResistance = false;
 string   g_lastSignalDetail = "";
 
 struct PosPnlEntry  { ulong posId; double pnl; };
@@ -883,19 +896,10 @@ void CheckEntry()
    if(HasOpenPosition()) return;
    if(!g_inSession) return;
    if(!g_haveRange) return;
+   if(!g_rangeWidthOk) return; // не реальный боковик, а два далёких старых уровня
 
-   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
-   double curPrice = (SymbolInfoDouble(_Symbol, SYMBOL_BID) + SymbolInfoDouble(_Symbol, SYMBOL_ASK)) / 2.0;
-
-   // Не реальный боковик, а просто два далёких старых уровня — пропускаем
-   // (см. пояснение у InpMaxRangeWidthPts выше).
-   if((g_curRes.lo - g_curSup.hi) / point > InpMaxRangeWidthPts) return;
-
-   bool nearSupport    = (curPrice >= g_curSup.lo) && ((curPrice - g_curSup.hi) / point <= InpZoneProximityPts);
-   bool nearResistance = (curPrice <= g_curRes.hi) && ((g_curRes.lo - curPrice) / point <= InpZoneProximityPts);
-
-   bool wantLong  = nearSupport    && (g_swingBias >= 0) && g_maLong;
-   bool wantShort = nearResistance && (g_swingBias <= 0) && g_maShort;
+   bool wantLong  = g_nearSupport    && (g_swingBias >= 0) && g_maLong;
+   bool wantShort = g_nearResistance && (g_swingBias <= 0) && g_maShort;
 
    if(!SpreadOK()) return;
    if(!CalendarClear()) return;
@@ -1139,6 +1143,20 @@ void OnTick()
    double curPrice = (SymbolInfoDouble(_Symbol, SYMBOL_BID) + SymbolInfoDouble(_Symbol, SYMBOL_ASK)) / 2.0;
    g_haveRange = GetActiveRange(g_h4Zones, curPrice, g_curRes, g_curSup);
 
+   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   if(g_haveRange)
+   {
+      g_rangeWidthOk   = (g_curRes.lo - g_curSup.hi) / point <= InpMaxRangeWidthPts;
+      g_nearSupport    = (curPrice >= g_curSup.lo) && ((curPrice - g_curSup.hi) / point <= InpZoneProximityPts);
+      g_nearResistance = (curPrice <= g_curRes.hi) && ((g_curRes.lo - curPrice) / point <= InpZoneProximityPts);
+   }
+   else
+   {
+      g_rangeWidthOk = false;
+      g_nearSupport = false;
+      g_nearResistance = false;
+   }
+
    double ma = BufferVal(h_ma, 0, 1);
    g_maLong  = (ma != EMPTY_VALUE) && (curPrice > ma);
    g_maShort = (ma != EMPTY_VALUE) && (curPrice < ma);
@@ -1269,14 +1287,13 @@ void DrawPanel()
    {
       double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
       double widthPts = (g_curRes.lo - g_curSup.hi) / point;
-      bool widthOk = widthPts <= InpMaxRangeWidthPts;
       texts[n] = StringFormat("Сопротивление: %.2f-%.2f (%d кас.)", g_curRes.lo, g_curRes.hi, g_curRes.touches);
       colors[n] = InpColorBad; n++;
       texts[n] = StringFormat("Поддержка: %.2f-%.2f (%d кас.)", g_curSup.lo, g_curSup.hi, g_curSup.touches);
       colors[n] = InpColorGood; n++;
       texts[n] = StringFormat("Ширина: %.0fпт %s (лимит %.0f)", widthPts,
-                               widthOk ? "✅" : "❌ слишком широко", InpMaxRangeWidthPts);
-      colors[n] = widthOk ? InpColorGood : InpColorBad; n++;
+                               g_rangeWidthOk ? "✅" : "❌ слишком широко", InpMaxRangeWidthPts);
+      colors[n] = g_rangeWidthOk ? InpColorGood : InpColorBad; n++;
    }
    else
    {
@@ -1286,6 +1303,35 @@ void DrawPanel()
                     (g_swingBias == -1) ? "▼ вниз (LH+LL) — только шорт" : "○ нет подтверждения";
    texts[n] = "Структура свингов: " + biasTxt;
    colors[n] = (g_swingBias != 0) ? InpColorGood : InpColorNeutral; n++;
+   texts[n] = ""; colors[n] = InpColorText; n++;
+
+   // Живой чек-лист: что ИМЕННО сейчас блокирует вход. Раньше приходилось
+   // гадать/присылать скриншоты, чтобы понять, на каком из условий застряли —
+   // теперь видно на самом графике.
+   texts[n] = "─── ПОЧЕМУ НЕ ВХОДИМ (живой чек-лист) ───"; colors[n] = InpColorHeader; n++;
+   texts[n] = StringFormat("Диапазон найден: %s", g_haveRange ? "✅" : "❌");
+   colors[n] = g_haveRange ? InpColorGood : InpColorBad; n++;
+   texts[n] = StringFormat("Ширина диапазона ОК: %s", g_haveRange ? (g_rangeWidthOk ? "✅" : "❌") : "—");
+   colors[n] = (g_haveRange && g_rangeWidthOk) ? InpColorGood : InpColorBad; n++;
+   texts[n] = StringFormat("Цена у поддержки: %s | у сопротивления: %s",
+                            g_nearSupport ? "✅" : "❌", g_nearResistance ? "✅" : "❌");
+   colors[n] = (g_nearSupport || g_nearResistance) ? InpColorGood : InpColorBad; n++;
+   texts[n] = StringFormat("MA(%d) согласна: %s", InpMAPeriod,
+                            (g_maLong || g_maShort) ? (g_maLong ? "✅ (лонг)" : "✅ (шорт)") : "❌");
+   colors[n] = (g_maLong || g_maShort) ? InpColorGood : InpColorBad; n++;
+   texts[n] = StringFormat("Сессия активна: %s", g_inSession ? "✅" : "❌");
+   colors[n] = g_inSession ? InpColorGood : InpColorBad; n++;
+   bool readyLong  = g_haveRange && g_rangeWidthOk && g_nearSupport    && (g_swingBias >= 0) && g_maLong  && g_inSession;
+   bool readyShort = g_haveRange && g_rangeWidthOk && g_nearResistance && (g_swingBias <= 0) && g_maShort && g_inSession;
+   if(readyLong || readyShort)
+   {
+      texts[n] = StringFormat("Все условия ОК (%s) — ждём пробой M5-зоны", readyLong ? "ЛОНГ" : "ШОРТ");
+      colors[n] = InpColorGood; n++;
+   }
+   else
+   {
+      texts[n] = "Не все условия совпали — сделка невозможна прямо сейчас"; colors[n] = InpColorNeutral; n++;
+   }
    texts[n] = ""; colors[n] = InpColorText; n++;
 
    texts[n] = "─── ШАГ 3-4: M5 ЗОНЫ И СИГНАЛ ───"; colors[n] = InpColorHeader; n++;
