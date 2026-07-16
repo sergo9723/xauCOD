@@ -66,17 +66,27 @@ input group "=== ИДЕНТИФИКАЦИЯ ==="
 input int     InpMagicNumber        = 202600;
 
 input group "=== ШАГ 1: ЗОНЫ H4 + СТРУКТУРА СВИНГОВ ==="
+// НАЙДЕНО (диагностика после жалобы "почему код не открывает сделки"): золото
+// весь этот год было в сильном тренде, а не в боковике. "Ближайшая зона сверху/
+// снизу" в такие периоды часто оказывается СТАРЫМ уровнем за много месяцев —
+// медианная ширина между такими зонами получилась ~7564 пт, а медианное
+// расстояние цены до ближайшей зоны — ~1622 пт (при старом InpZoneProximityPts
+// =150 это почти никогда не срабатывало). Добавлен InpMaxRangeWidthPts —
+// диапазон засчитывается, только если он ДЕЙСТВИТЕЛЬНО узкий (реальный боковик,
+// а не два случайных далёких уровня). Также расширены InpZoneProximityPts и
+// InpSessionWindowMinutes — раньше они сильно резали и без того редкие сигналы.
 input int     InpH4PivotLegBars     = 3;    // баров слева/справа для фрактального свинга на H4
 input int     InpH4LookbackBars     = 150;  // сколько H4-баров назад искать зоны (~25 дней)
 input double  InpH4ZoneClusterPts   = 300;  // касания в пределах этого расстояния — одна зона
 input int     InpH4MinTouches       = 2;    // мин. касаний, чтобы зона считалась подтверждённой
-input double  InpZoneProximityPts   = 150;  // насколько близко цена должна быть к H4-зоне
+input double  InpZoneProximityPts   = 400;  // насколько близко цена должна быть к H4-зоне (было 150)
+input double  InpMaxRangeWidthPts   = 3000; // макс. ширина H4-диапазона — иначе это не реальный боковик
 input int     InpSwingConfirmCount  = 2;    // сколько последних свинг-хаев/лоу проверяем на направление
 
 input group "=== ШАГ 2: СЕССИЯ И ИНДИКАТОР 'ИМПУЛЬС' ==="
 input int     InpSessionStartHour   = 16;   // начало торгового окна (время сервера — настройте под NY-открытие у вашего брокера)
 input int     InpSessionStartMinute = 30;
-input int     InpSessionWindowMinutes = 240; // сколько минут после старта окна ищем сделки
+input int     InpSessionWindowMinutes = 600; // сколько минут после старта окна ищем сделки (было 240)
 input bool    InpSkipFirstCandle    = true; // не входить на первой M5-свече после открытия окна
 input int     InpMAPeriod           = 50;   // период индикатора "Импульс" (обычная MA)
 input ENUM_MA_METHOD InpMAMethod    = MODE_SMA;
@@ -87,13 +97,31 @@ input int     InpLtfLookbackBars    = 150;  // M5-баров назад (~12.5 �
 input double  InpLtfZoneClusterPts  = 80;
 input int     InpLtfMinTouches      = 2;
 
-input group "=== СДЕЛКА ==="
+input group "=== СДЕЛКА (TP/SL — по запросу) ==="
 input bool    InpUseFixedLot        = true;
-input double  InpLotSize            = 0.01;
+input double  InpLotSize            = 0.1;
 input double  InpRiskPct            = 1.0;   // % риска от баланса (если InpUseFixedLot=false)
 input double  InpSLBufferPts        = 50;    // буфер за пределы H4-зоны для стоп-лосса
-input double  InpTPAtOppositeZonePct = 80.0; // % пути до противоположной H4-зоны — там ставим TP
+input int     InpMaxSLPts           = 2500;  // максимум для SL (ваше "стоп до 2500 пунктов")
+input double  InpTPAtOppositeZonePct = 80.0; // % пути до противоположной H4-зоны — там базовый TP (потолок)
+input int     InpMinTPPts           = 50;    // минимум для TP (ваше "минимум тейк 50 пунктов")
+input int     InpMaxTPPts           = 1000;  // максимум для TP (ваше "до 1000 пунктов максимум тейк")
 input int     InpMaxHoldMinutes     = 90;    // макс. время удержания сделки (ваше "40 мин - 1.5 часа")
+
+input group "=== ДИНАМИЧЕСКАЯ ФИКСАЦИЯ ПРИБЫЛИ ПРИ СТАГНАЦИИ (по запросу) ==="
+// "Тейк должен брать так: если поднялся в плюс минимум до 50 и прыгает от 50 до
+// 800 — закрыть в прибыль, если цена долго стоит от 5 до 30 минут, взять
+// лучший тейк по ситуации." Реализовано так: чем БОЛЬШЕ прибыль внутри этого
+// коридора (ближе к InpStallUpperRefPts), тем МЕНЬШЕ терпения нужно, чтобы
+// зафиксировать её (InpStallMinMinutes) — крупную прибыль рискованно ждать
+// долго. Чем МЕНЬШЕ прибыль (ближе к InpMinTPPts), тем больше терпения
+// (InpStallMaxMinutes) — даём мелкой прибыли шанс дорасти. "Простояла" —
+// значит пик прибыли не обновлялся (с допуском на шум InpStallEpsilonPts).
+input bool    InpUseStallExit       = true;
+input double  InpStallUpperRefPts   = 800;  // верхняя граница "прыгает от 50 до 800"
+input int     InpStallMinMinutes    = 5;    // требуемая стагнация при прибыли ~InpStallUpperRefPts
+input int     InpStallMaxMinutes    = 30;   // требуемая стагнация при прибыли ~InpMinTPPts
+input double  InpStallEpsilonPts    = 20;   // допуск на шум для "новый пик"
 
 input group "=== ЗАЩИТА КАПИТАЛА ==="
 input int     InpMaxConsecutiveLosses = 3;
@@ -170,6 +198,28 @@ string   g_lastSignalDetail = "";
 
 struct PosPnlEntry  { ulong posId; double pnl; };
 PosPnlEntry g_posPnl[];
+
+// Для динамической фиксации прибыли при стагнации (StallExit)
+struct PosStallState { ulong posId; double peakPts; datetime peakTime; };
+PosStallState g_posStall[];
+
+int GetOrCreateStall(ulong posId)
+{
+   for(int i = 0; i < ArraySize(g_posStall); i++)
+      if(g_posStall[i].posId == posId) return i;
+   int n = ArraySize(g_posStall);
+   ArrayResize(g_posStall, n + 1);
+   g_posStall[n].posId = posId;
+   g_posStall[n].peakPts = 0.0;
+   g_posStall[n].peakTime = TimeCurrent();
+   return n;
+}
+
+void RemoveStallState(ulong posId)
+{
+   for(int i = 0; i < ArraySize(g_posStall); i++)
+      if(g_posStall[i].posId == posId) { ArrayRemove(g_posStall, i, 1); return; }
+}
 
 //+------------------------------------------------------------------+
 //| УТИЛИТЫ (общие, как в предыдущих EA)                              |
@@ -553,14 +603,15 @@ bool HasOpenPosition()
 }
 
 //+------------------------------------------------------------------+
-//| Управление открытой позицией: только принудительное закрытие по   |
-//| времени (InpMaxHoldMinutes) — стратегия описывает удержание        |
-//| 40 мин - 1.5 часа максимум, TP/SL расставлены сразу при входе от   |
-//| границ диапазона.                                                  |
+//| Управление открытой позицией: принудительное закрытие по времени  |
+//| (InpMaxHoldMinutes) + динамическая фиксация прибыли при стагнации  |
+//| (StallExit, по запросу — см. пояснение у входных параметров).      |
 //+------------------------------------------------------------------+
-void ManageOpenPositions()
+void ManageOpenPositions(bool isNewLtfBar)
 {
    datetime now = TimeCurrent();
+   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
       if(!posInfo.SelectByIndex(i)) continue;
@@ -568,12 +619,46 @@ void ManageOpenPositions()
       long posMagic = posInfo.Magic();
       if(posMagic != g_magicLong && posMagic != g_magicShort) continue;
 
+      ulong ticket = posInfo.Ticket();
+      ulong posId  = posInfo.Identifier();
       datetime openTime = (datetime)posInfo.Time();
+
       if(InpMaxHoldMinutes > 0 && (now - openTime) >= (long)InpMaxHoldMinutes * 60)
       {
-         ulong ticket = posInfo.Ticket();
          if(trade.PositionClose(ticket))
             Print("⏱ Закрыто по времени (макс. ", InpMaxHoldMinutes, " мин): тикет ", ticket);
+         continue;
+      }
+
+      if(InpUseStallExit && isNewLtfBar)
+      {
+         ENUM_POSITION_TYPE type = posInfo.PositionType();
+         double openPrice = posInfo.PriceOpen();
+         double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+         double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+         double profitPts = (type == POSITION_TYPE_BUY) ? (bid - openPrice) / point : (openPrice - ask) / point;
+
+         int sIdx = GetOrCreateStall(posId);
+         if(profitPts > g_posStall[sIdx].peakPts + InpStallEpsilonPts)
+         {
+            g_posStall[sIdx].peakPts = profitPts;
+            g_posStall[sIdx].peakTime = now;
+         }
+
+         if(profitPts >= InpMinTPPts)
+         {
+            double frac = (profitPts - InpMinTPPts) / (InpStallUpperRefPts - InpMinTPPts);
+            frac = MathMax(0.0, MathMin(1.0, frac));
+            double requiredMinutes = InpStallMaxMinutes + frac * (InpStallMinMinutes - InpStallMaxMinutes);
+            long stalledSeconds = now - g_posStall[sIdx].peakTime;
+            if(stalledSeconds >= (long)(requiredMinutes * 60))
+            {
+               if(trade.PositionClose(ticket))
+                  Print("📊 Стагнация: тикет ", ticket, " закрыт в прибыли +",
+                        DoubleToString(profitPts, 0), "пт (простояла ", stalledSeconds/60,
+                        " мин ≥ треб. ", DoubleToString(requiredMinutes,1), " мин)");
+            }
+         }
       }
    }
 }
@@ -627,22 +712,36 @@ bool OpenTrade(int direction)
    double bid    = SymbolInfoDouble(_Symbol, SYMBOL_BID);
    int    minStop = GetMinStopPoints();
 
+   // SL/TP берутся от структуры H4-зон, но зажаты в коридор InpMinTPPts/
+   // InpMaxTPPts и потолком InpMaxSLPts (по запросу) — зона задаёт НАПРАВЛЕНИЕ
+   // и ЛОГИКУ (куда ставить, где реалистичная цель), а коридор — абсолютные
+   // границы здравого смысла для лота/риска.
    double entry, sl, tp;
    if(direction == 1)
    {
       entry = ask;
-      sl = NormalizeDouble(g_curSup.lo - InpSLBufferPts * point, digits);
+      double slPtsRaw = (entry - (g_curSup.lo - InpSLBufferPts * point)) / point;
+      double slPtsC = MathMin(slPtsRaw, (double)InpMaxSLPts);
+      sl = NormalizeDouble(entry - slPtsC * point, digits);
+
       double distToRes = g_curRes.lo - entry;
       if(distToRes <= 0.0) return false;
-      tp = NormalizeDouble(entry + distToRes * (InpTPAtOppositeZonePct / 100.0), digits);
+      double tpPtsRaw = (distToRes * (InpTPAtOppositeZonePct / 100.0)) / point;
+      double tpPtsC = MathMax((double)InpMinTPPts, MathMin((double)InpMaxTPPts, tpPtsRaw));
+      tp = NormalizeDouble(entry + tpPtsC * point, digits);
    }
    else
    {
       entry = bid;
-      sl = NormalizeDouble(g_curRes.hi + InpSLBufferPts * point, digits);
+      double slPtsRaw = ((g_curRes.hi + InpSLBufferPts * point) - entry) / point;
+      double slPtsC = MathMin(slPtsRaw, (double)InpMaxSLPts);
+      sl = NormalizeDouble(entry + slPtsC * point, digits);
+
       double distToSup = entry - g_curSup.hi;
       if(distToSup <= 0.0) return false;
-      tp = NormalizeDouble(entry - distToSup * (InpTPAtOppositeZonePct / 100.0), digits);
+      double tpPtsRaw = (distToSup * (InpTPAtOppositeZonePct / 100.0)) / point;
+      double tpPtsC = MathMax((double)InpMinTPPts, MathMin((double)InpMaxTPPts, tpPtsRaw));
+      tp = NormalizeDouble(entry - tpPtsC * point, digits);
    }
 
    // Защита от устаревших данных о зонах (H4-зоны пересчитываются раз в 4 часа,
@@ -707,6 +806,10 @@ void CheckEntry()
    double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
    double curPrice = (SymbolInfoDouble(_Symbol, SYMBOL_BID) + SymbolInfoDouble(_Symbol, SYMBOL_ASK)) / 2.0;
 
+   // Не реальный боковик, а просто два далёких старых уровня — пропускаем
+   // (см. пояснение у InpMaxRangeWidthPts выше).
+   if((g_curRes.lo - g_curSup.hi) / point > InpMaxRangeWidthPts) return;
+
    bool nearSupport    = (curPrice >= g_curSup.lo) && ((curPrice - g_curSup.hi) / point <= InpZoneProximityPts);
    bool nearResistance = (curPrice <= g_curRes.hi) && ((g_curRes.lo - curPrice) / point <= InpZoneProximityPts);
 
@@ -769,6 +872,26 @@ int OnInit()
       Print("❌ ERROR: InpTPAtOppositeZonePct должен быть в (0,100]");
       return INIT_PARAMETERS_INCORRECT;
    }
+   if(InpMinTPPts <= 0 || InpMaxTPPts <= InpMinTPPts)
+   {
+      Print("❌ ERROR: InpMinTPPts/InpMaxTPPts заданы некорректно (Max должен быть > Min)");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+   if(InpMaxSLPts <= 0)
+   {
+      Print("❌ ERROR: InpMaxSLPts должен быть > 0");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+   if(InpMaxRangeWidthPts <= 0)
+   {
+      Print("❌ ERROR: InpMaxRangeWidthPts должен быть > 0");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+   if(InpUseStallExit && (InpStallUpperRefPts <= InpMinTPPts || InpStallMinMinutes <= 0 || InpStallMaxMinutes <= 0))
+   {
+      Print("❌ ERROR: InpStallUpperRefPts должен быть > InpMinTPPts, InpStallMin/MaxMinutes должны быть > 0");
+      return INIT_PARAMETERS_INCORRECT;
+   }
    if(InpMaxConsecutiveLosses < 0)
    {
       Print("❌ ERROR: InpMaxConsecutiveLosses не может быть отрицательным");
@@ -805,6 +928,7 @@ int OnInit()
       Print("🔁 Восстановлено состояние стоп-машины: ПАУЗА (", g_consecutive_losses, " убытков подряд)");
 
    ArrayResize(g_posPnl, 0);
+   ArrayResize(g_posStall, 0);
    EventSetTimer(1);
 
    Print("════════════════════════════════════════════");
@@ -863,7 +987,12 @@ void OnTimer()
 //+------------------------------------------------------------------+
 void OnTick()
 {
-   ManageOpenPositions();
+   // isNewLtfBar считается ДО ManageOpenPositions() — StallExit внутри неё
+   // обновляет пик прибыли раз за M5-бар, а не на каждом тике.
+   datetime curLtfBar = iTime(_Symbol, PERIOD_M5, 0);
+   bool isNewLtfBar = (curLtfBar != g_last_ltf_bar);
+
+   ManageOpenPositions(isNewLtfBar);
 
    datetime serverTime = TimeCurrent();
    MqlDateTime dt;
@@ -893,8 +1022,6 @@ void OnTick()
    }
 
    // --- Шаг 3: пересчёт M5 зон раз за M5-бар ---
-   datetime curLtfBar = iTime(_Symbol, PERIOD_M5, 0);
-   bool isNewLtfBar = (curLtfBar != g_last_ltf_bar);
    if(isNewLtfBar)
    {
       g_last_ltf_bar = curLtfBar;
@@ -942,6 +1069,7 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
    bool stillOpen = PositionSelectByTicket(posId);
    if(stillOpen) return;
 
+   RemoveStallState(posId);
    double finalPnl = PopPosPnl(posId);
    if(finalPnl > 0.0)
    {
@@ -1032,10 +1160,16 @@ void DrawPanel()
    texts[n] = "─── ШАГ 1: H4 ДИАПАЗОН ───"; colors[n] = InpColorHeader; n++;
    if(g_haveRange)
    {
+      double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+      double widthPts = (g_curRes.lo - g_curSup.hi) / point;
+      bool widthOk = widthPts <= InpMaxRangeWidthPts;
       texts[n] = StringFormat("Сопротивление: %.2f-%.2f (%d кас.)", g_curRes.lo, g_curRes.hi, g_curRes.touches);
       colors[n] = InpColorBad; n++;
       texts[n] = StringFormat("Поддержка: %.2f-%.2f (%d кас.)", g_curSup.lo, g_curSup.hi, g_curSup.touches);
       colors[n] = InpColorGood; n++;
+      texts[n] = StringFormat("Ширина: %.0fпт %s (лимит %.0f)", widthPts,
+                               widthOk ? "✅" : "❌ слишком широко", InpMaxRangeWidthPts);
+      colors[n] = widthOk ? InpColorGood : InpColorBad; n++;
    }
    else
    {
