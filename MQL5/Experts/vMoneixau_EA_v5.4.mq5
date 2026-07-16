@@ -127,10 +127,12 @@ input int     InpLtfMinTouches      = 2;
 
 input group "=== СОГЛАСИЕ НЕДАВНЕГО ИМПУЛЬСА (v5.4, по запросу) ==="
 // "Определять направление рынка и открывать позицию ПО направлению рынка".
-// Пробой M5-зоны формально мог сработать, даже если последние несколько
-// M5-свечей ДО этого явно шли против сделки (например, 4 красные свечи
-// подряд перед входом в лонг). Эта проверка отменяет вход, если ВСЕ
-// последние InpMomentumLookback свечи против направления сделки.
+// v5.4 изначально отменяла вход, только если ВСЕ последние свечи были
+// против сделки — этого оказалось мало: если из 5 свечей 4 зелёных и 1
+// красная, вход в шорт всё равно проходил (ваш пример "куча зелёных и одна
+// красная, а входит в шорт"). Теперь считаем ПЕРЕВЕС бычьих/медвежьих
+// свечей за последние InpMomentumLookback баров и требуем, чтобы БОЛЬШИНСТВО
+// было ЗА направление сделки — не просто "не все против".
 input bool    InpRequireMomentumAgree = true;
 input int     InpMomentumLookback     = 4;  // сколько последних M5-свечей проверяем (ваш пример — 4)
 
@@ -743,17 +745,25 @@ void ManageOpenPositions(bool isNewLtfBar)
 //+------------------------------------------------------------------+
 bool RecentCandlesAgree(int direction, int lookback)
 {
+   // НАЙДЕНО (реальный прогон): старая версия требовала "ВСЕ свечи против",
+   // чтобы отменить вход — этого было мало. Если из 5 последних свечей 4
+   // зелёных и 1 красная, старая проверка всё равно пропускала ШОРТ (нашла
+   // хотя бы одну не-бычью свечу и сразу решила "согласие есть"). Это и есть
+   // ваш пример "куча зелёных свечей и одна красная, а код входит в шорт".
+   // Теперь считаем ПЕРЕВЕС: сколько свечей бычьих, сколько медвежьих, и
+   // требуем, чтобы БОЛЬШИНСТВО было ЗА направление сделки — не просто
+   // "не все против".
+   int bullishCount = 0, bearishCount = 0;
    for(int shift = 1; shift <= lookback; shift++)
    {
       double o = iOpen(_Symbol, PERIOD_M5, shift);
       double c = iClose(_Symbol, PERIOD_M5, shift);
-      bool bullish = c > o;
-      bool bearish = c < o;
-      // Если хотя бы одна свеча ЗА направление сделки (или дожи, не против) — согласие есть
-      if(direction == 1 && !bearish) return true;
-      if(direction == -1 && !bullish) return true;
+      if(c > o) bullishCount++;
+      else if(c < o) bearishCount++;
+      // дожи (c==o) не считаем ни туда, ни сюда
    }
-   // Все lookback свечей оказались против направления сделки
+   if(direction == 1)  return bullishCount > bearishCount;
+   if(direction == -1) return bearishCount > bullishCount;
    return false;
 }
 
@@ -910,9 +920,9 @@ void CheckEntry()
          OpenTrade(1);
       else
       {
-         Print("⚠️ Пробой вверх есть, но последние ", InpMomentumLookback,
-               " M5-свечи все против (красные) — вход отменён");
-         g_lastSignalDetail += StringFormat(" [ОТМЕНЕНО: %d красных свечей подряд]", InpMomentumLookback);
+         Print("⚠️ Пробой вверх есть, но среди последних ", InpMomentumLookback,
+               " M5-свечей нет перевеса бычьих — вход отменён");
+         g_lastSignalDetail += StringFormat(" [ОТМЕНЕНО: нет перевеса зелёных свечей из %d]", InpMomentumLookback);
       }
    }
    else if(wantShort && TryLtfBreakout(-1))
@@ -921,9 +931,9 @@ void CheckEntry()
          OpenTrade(-1);
       else
       {
-         Print("⚠️ Пробой вниз есть, но последние ", InpMomentumLookback,
-               " M5-свечи все против (зелёные) — вход отменён");
-         g_lastSignalDetail += StringFormat(" [ОТМЕНЕНО: %d зелёных свечей подряд]", InpMomentumLookback);
+         Print("⚠️ Пробой вниз есть, но среди последних ", InpMomentumLookback,
+               " M5-свечей нет перевеса медвежьих — вход отменён");
+         g_lastSignalDetail += StringFormat(" [ОТМЕНЕНО: нет перевеса красных свечей из %d]", InpMomentumLookback);
       }
    }
 }
@@ -1051,8 +1061,8 @@ int OnInit()
    Print("SL буфер: ", InpSLBufferPts, "пт | TP на ", InpTPAtOppositeZonePct, "% пути до противоположной зоны");
    Print("Макс. удержание сделки: ", InpMaxHoldMinutes, " мин");
    if(InpRequireMomentumAgree)
-      Print("Согласие импульса: вход отменяется, если последние ", InpMomentumLookback,
-            " M5-свечей все против направления сделки");
+      Print("Согласие импульса: вход отменяется без перевеса свечей (бычьих/медвежьих) ",
+            "за направление сделки среди последних ", InpMomentumLookback, " M5-свечей");
    Print("Стоп-машина после ", InpMaxConsecutiveLosses, " убытков подряд");
    Print("════════════════════════════════════════════");
    return INIT_SUCCEEDED;
