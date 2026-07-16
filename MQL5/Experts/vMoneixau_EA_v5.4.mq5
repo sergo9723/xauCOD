@@ -649,13 +649,28 @@ int GetSwingTrendBias(SwingPoint &swings[], int confirmCount)
 //+------------------------------------------------------------------+
 bool InSessionWindow()
 {
+   // НАЙДЕНО (полный аудит): при InpSessionStartHour=16:30 и
+   // InpSessionWindowMinutes=900 расчётный конец окна = 990+900=1890 минут —
+   // а curHM (минуты с начала ТЕКУЩИХ суток) физически не может превысить
+   // 1439. Значит curHM >= endHM никогда не срабатывало в течение того же
+   // календарного дня, и окно МОЛЧА обрывалось на полуночи — реально
+   // получалось только ~450 минут (16:30-24:00) вместо заявленных 900. Это
+   // силой резало половину настроенного окна сессии. Исправлено — окно,
+   // переходящее через полночь, теперь корректно продолжается в раннее утро
+   // следующего календарного дня.
    datetime serverTime = TimeCurrent();
    MqlDateTime dt;
    TimeToStruct(serverTime, dt);
    int curHM = dt.hour * 60 + dt.min;
    int startHM = InpSessionStartHour * 60 + InpSessionStartMinute;
    int endHM = startHM + InpSessionWindowMinutes;
-   if(curHM < startHM || curHM >= endHM) return false;
+
+   bool inWindow;
+   if(endHM <= 1440)
+      inWindow = (curHM >= startHM && curHM < endHM);
+   else
+      inWindow = (curHM >= startHM) || (curHM < endHM - 1440);
+   if(!inWindow) return false;
 
    if(InpSkipFirstCandle)
    {
