@@ -78,10 +78,25 @@
 //|  MT5 использует НАСТОЯЩИЙ M5). Прогоните сами в Strategy Tester,   |
 //|  прежде чем доверять живые деньги.                                |
 //+------------------------------------------------------------------+
+//+------------------------------------------------------------------+
+//| ДОБАВЛЕНО (по запросу): безубыток, частичное закрытие и трейлинг- |
+//| стоп, перенесённые из XAUUSD_TimeStrategy_EA_v4.9 (тот же код,    |
+//| что вы прислали как "работает у меня на реале без единого минуса  |
+//| за месяц"). ВАЖНО ЧЕСТНО: в v4.9 этих механизмов НЕТ "гарантии    |
+//| без минуса" — это обычное управление уже прибыльной позицией      |
+//| (перенос SL в безубыток при +InpBreakEvenTriggerPts, частичная    |
+//| фиксация прибыли, подтягивание SL за ценой). Пока профит не       |
+//| достиг порога безубытка, SL стоит на исходном месте — если цена    |
+//| сразу пойдёт против сделки, позиция закроется по обычному SL в     |
+//| минус, точно как в v4.9 (в тесте этой же сессии — 12 убыточных из  |
+//| 153 сделок). Эффект этих механизмов — уменьшить СРЕДНИЙ размер     |
+//| убытка и защитить часть прибыли на сделках, которые успели уйти в  |
+//| плюс, а не убрать убытки полностью.                                |
+//+------------------------------------------------------------------+
 #property copyright   "vMoneixau v5.4 — новая стратегия, требует проверки в тестере"
-#property version     "5.40"
+#property version     "5.41"
 #property strict
-#property description "vMoneixau v5.4 — H4 зоны + структура свингов + сессия/MA + M5 пробой + согласие импульса"
+#property description "vMoneixau v5.4 — H4 зоны + структура свингов + сессия/MA + M5 пробой + согласие импульса + БУ/частичное закрытие/трейлинг"
 
 #include <Trade\Trade.mqh>
 #include <Trade\PositionInfo.mqh>
@@ -155,6 +170,23 @@ input double  InpTPAtOppositeZonePct = 80.0; // % пути до противоп
 input int     InpMinTPPts           = 50;    // минимум для TP (ваше "минимум тейк 50 пунктов")
 input int     InpMaxTPPts           = 1000;  // максимум для TP (ваше "до 1000 пунктов максимум тейк")
 input int     InpMaxHoldMinutes     = 90;    // макс. время удержания сделки (ваше "40 мин - 1.5 часа")
+
+input group "=== БЕЗУБЫТОК / ЧАСТИЧНОЕ ЗАКРЫТИЕ / ТРЕЙЛИНГ (перенесено из v4.9 по запросу) ==="
+// Перенесено из XAUUSD_TimeStrategy_EA_v4.9 — ТЕ ЖЕ механизмы, что уже
+// проверены на реальном счёте. Это НЕ "гарантия без минуса" (см. пояснение
+// в чате) — это управление уже прибыльной позицией: снижает средний убыток
+// и защищает часть плавающей прибыли, но если цена сразу пойдёт против
+// сделки, не дойдя до порога безубытка, позиция всё равно закроется по
+// своему обычному SL в минус — как и в v4.9.
+input bool    InpUseBreakEven        = true;
+input int     InpBreakEvenTriggerPts = 60;   // профит в пунктах для переноса SL в безубыток
+input int     InpBreakEvenLockPts    = 15;   // сколько пунктов профита фиксируем при переносе
+input bool    InpUsePartialClose     = true;
+input double  InpPartialClosePct     = 50.0; // % объёма закрыть частично
+input double  InpPartialCloseAtTPPct = 60.0; // на скольки % от дистанции до TP делать частичное закрытие
+input bool    InpUseTrailingStop     = true;
+input int     InpTrailingStartPts    = 120;  // профит для начала трейлинга (после безубытка)
+input int     InpTrailingStepPts     = 70;   // дистанция трейлинга от текущей цены
 
 input group "=== ДИНАМИЧЕСКАЯ ФИКСАЦИЯ ПРИБЫЛИ ПРИ СТАГНАЦИИ (по запросу) ==="
 // "Тейк должен брать так: если поднялся в плюс минимум до 50 и прыгает от 50 до
@@ -256,8 +288,9 @@ string   g_lastSignalDetail = "";
 struct PosPnlEntry  { ulong posId; double pnl; };
 PosPnlEntry g_posPnl[];
 
-// Для динамической фиксации прибыли при стагнации (StallExit)
-struct PosStallState { ulong posId; double peakPts; datetime peakTime; };
+// Для динамической фиксации прибыли при стагнации (StallExit) + перенесённое
+// из v4.9 состояние безубытка/частичного закрытия (одна позиция — одна запись).
+struct PosStallState { ulong posId; double peakPts; datetime peakTime; bool beDone; bool partialDone; };
 PosStallState g_posStall[];
 
 int GetOrCreateStall(ulong posId)
@@ -269,6 +302,8 @@ int GetOrCreateStall(ulong posId)
    g_posStall[n].posId = posId;
    g_posStall[n].peakPts = 0.0;
    g_posStall[n].peakTime = TimeCurrent();
+   g_posStall[n].beDone = false;
+   g_posStall[n].partialDone = false;
    return n;
 }
 
@@ -708,7 +743,9 @@ bool HasOpenPosition()
 void ManageOpenPositions(bool isNewLtfBar)
 {
    datetime now = TimeCurrent();
-   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   double point  = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   int    digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+   int    minStop = GetMinStopPoints();
 
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
@@ -726,6 +763,83 @@ void ManageOpenPositions(bool isNewLtfBar)
          if(trade.PositionClose(ticket))
             Print("⏱ Закрыто по времени (макс. ", InpMaxHoldMinutes, " мин): тикет ", ticket);
          continue;
+      }
+
+      // --- Безубыток / частичное закрытие / трейлинг (перенесено из v4.9) ---
+      {
+         ENUM_POSITION_TYPE type = posInfo.PositionType();
+         double openPrice = posInfo.PriceOpen();
+         double curSL = posInfo.StopLoss();
+         double curTP = posInfo.TakeProfit();
+         double volume = posInfo.Volume();
+         double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+         double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+         double profitPtsMgmt = (type == POSITION_TYPE_BUY) ? (bid - openPrice) / point : (openPrice - ask) / point;
+
+         int mIdx = GetOrCreateStall(posId);
+
+         if(InpUseBreakEven && !g_posStall[mIdx].beDone && profitPtsMgmt >= InpBreakEvenTriggerPts)
+         {
+            int lockPts = MathMax(InpBreakEvenLockPts, minStop);
+            double newSL = (type == POSITION_TYPE_BUY)
+                            ? NormalizeDouble(openPrice + lockPts * point, digits)
+                            : NormalizeDouble(openPrice - lockPts * point, digits);
+            bool improves = (type == POSITION_TYPE_BUY) ? (curSL < newSL) : (curSL == 0.0 || curSL > newSL);
+            if(improves)
+            {
+               if(trade.PositionModify(ticket, newSL, curTP))
+               {
+                  g_posStall[mIdx].beDone = true;
+                  curSL = newSL;
+                  Print("🔒 Безубыток: тикет ", ticket, " SL→", DoubleToString(newSL, digits));
+               }
+            }
+            else
+               g_posStall[mIdx].beDone = true;
+         }
+
+         if(InpUsePartialClose && !g_posStall[mIdx].partialDone)
+         {
+            double tpDist = (curTP != 0.0) ? MathAbs(curTP - openPrice) / point : InpMinTPPts;
+            double target = tpDist * (InpPartialCloseAtTPPct / 100.0);
+            if(profitPtsMgmt >= target)
+            {
+               double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+               double lotMin  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+               if(lotStep <= 0.0) lotStep = 0.01;
+               if(lotMin  <= 0.0) lotMin  = 0.01;
+               double closeVol = MathFloor(volume * (InpPartialClosePct / 100.0) / lotStep) * lotStep;
+               closeVol = NormalizeDouble(closeVol, 2);
+               double remain = NormalizeDouble(volume - closeVol, 2);
+               if(closeVol >= lotMin && remain >= lotMin)
+               {
+                  if(trade.PositionClosePartial(ticket, closeVol))
+                  {
+                     g_posStall[mIdx].partialDone = true;
+                     Print("💰 Частичное закрытие: тикет ", ticket, " объём ", DoubleToString(closeVol, 2));
+                  }
+               }
+               else
+                  g_posStall[mIdx].partialDone = true;
+            }
+         }
+
+         if(InpUseTrailingStop && g_posStall[mIdx].beDone && profitPtsMgmt >= InpTrailingStartPts)
+         {
+            int stepPts = MathMax(InpTrailingStepPts, minStop);
+            if(type == POSITION_TYPE_BUY)
+            {
+               double newSL = NormalizeDouble(bid - stepPts * point, digits);
+               if(newSL > curSL)
+                  trade.PositionModify(ticket, newSL, curTP);
+            }
+            else
+            {
+               double newSL = NormalizeDouble(ask + stepPts * point, digits);
+               if(curSL == 0.0 || newSL < curSL)
+                  trade.PositionModify(ticket, newSL, curTP);
+            }
+         }
       }
 
       if(InpUseStallExit && isNewLtfBar)
@@ -1034,6 +1148,31 @@ int OnInit()
       Print("❌ ERROR: InpStallUpperRefPts должен быть > InpMinTPPts, InpStallMin/MaxMinutes должны быть > 0");
       return INIT_PARAMETERS_INCORRECT;
    }
+   if(InpUseBreakEven && (InpBreakEvenTriggerPts <= 0 || InpBreakEvenLockPts <= 0))
+   {
+      Print("❌ ERROR: InpBreakEvenTriggerPts и InpBreakEvenLockPts должны быть > 0");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+   if(InpUseBreakEven && InpBreakEvenLockPts >= InpBreakEvenTriggerPts)
+   {
+      Print("❌ ERROR: InpBreakEvenLockPts должен быть МЕНЬШЕ InpBreakEvenTriggerPts");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+   if(InpUsePartialClose && (InpPartialClosePct <= 0.0 || InpPartialClosePct >= 100.0))
+   {
+      Print("❌ ERROR: InpPartialClosePct должен быть в диапазоне (0,100)");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+   if(InpUsePartialClose && InpPartialCloseAtTPPct <= 0.0)
+   {
+      Print("❌ ERROR: InpPartialCloseAtTPPct должен быть > 0");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+   if(InpUseTrailingStop && (InpTrailingStartPts <= 0 || InpTrailingStepPts <= 0))
+   {
+      Print("❌ ERROR: InpTrailingStartPts и InpTrailingStepPts должны быть > 0");
+      return INIT_PARAMETERS_INCORRECT;
+   }
    if(InpMaxConsecutiveLosses < 0)
    {
       Print("❌ ERROR: InpMaxConsecutiveLosses не может быть отрицательным");
@@ -1090,6 +1229,9 @@ int OnInit()
          " кластер=", InpLtfZoneClusterPts, "пт) — вход по подтверждённому закрытию за зоной");
    Print("SL буфер: ", InpSLBufferPts, "пт | TP на ", InpTPAtOppositeZonePct, "% пути до противоположной зоны");
    Print("Макс. удержание сделки: ", InpMaxHoldMinutes, " мин");
+   Print("Безубыток: ", (InpUseBreakEven ? "ON" : "OFF"),
+         " | Частичное закрытие: ", (InpUsePartialClose ? "ON" : "OFF"),
+         " | Трейлинг: ", (InpUseTrailingStop ? "ON" : "OFF"));
    if(InpRequireMomentumAgree)
       Print("Согласие импульса: вход отменяется без перевеса свечей (бычьих/медвежьих) ",
             "за направление сделки среди последних ", InpMomentumLookback, " M5-свечей");
