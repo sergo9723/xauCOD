@@ -113,10 +113,36 @@
 //|    входов приостанавливается на это время вместо непрерывной       |
 //|    проверки каждую M5-свечу.                                       |
 //+------------------------------------------------------------------+
-#property copyright   "vMoneixau v5.5 — новая стратегия, требует проверки в тестере"
-#property version     "5.50"
+//+------------------------------------------------------------------+
+//| v5.51 — ПО ИТОГАМ FUNNEL-ПРОГОНА (Python-зеркало логики на M15-    |
+//| данных за ГОД): исходная v5.5 не дала НИ ОДНОЙ сделки за год — не   |
+//| из-за одной ошибки, а из-за нескольких фильтров, почти              |
+//| взаимоисключающих в связке. Исправлены КОРНИ:                       |
+//| 1) Лимит ширины H4-диапазона (резал 92%) → по умолчанию ВЫКЛ (0):   |
+//|    TP/SL и так зажаты потолками, близость к краю обязательна.       |
+//| 2) MA-фильтр требовал "цена выше MA+50пт И MA растёт" — у поддержки |
+//|    цена по определению у/ниже своей MA, а MA разворачивается позже  |
+//|    цены. Буфер 50→20, наклон MA теперь опционален (по умолч. ВЫКЛ). |
+//| 3) M15-подтверждение искало зону СТРОГО ниже/выше цены — исключало  |
+//|    ровно ту зону, от которой отбиваемся. Теперь ищется ближайшая    |
+//|    зона нужного типа в пределах InpM15ZoneProximityPts, включая     |
+//|    случай "цена внутри зоны".                                       |
+//| 4) Подтверждённый зонный H4-коридор в тренде часто не существует    |
+//|    (на хаях выше цены зон нет) — добавлена запасная рамка max/min   |
+//|    последних InpHLRangeBars H4-баров ("видно максимум и минимум").  |
+//| 5) Боковик-пауза срабатывала при нейтральном bias на H4-баре 16:00  |
+//|    и съедала 45 из 60 минут окна входа — теперь пауза только когда  |
+//|    рамки нет вообще.                                                |
+//| 6) Запасной триггер входа: закрытие M5-свечи за max/min последних   |
+//|    InpSimpleBreakoutBars M5-баров, когда формальной M5-зоны рядом    |
+//|    нет ("пробили уровень, свеча закрылась выше — подтверждение").    |
+//| Итог зеркального прогона за год: 0 сделок → 4 (3 в плюс, +498 пт);  |
+//| реальный M5 в тестере даст больше (зеркало на M15 в 3 раза грубее). |
+//+------------------------------------------------------------------+
+#property copyright   "vMoneixau v5.51 — новая стратегия, требует проверки в тестере"
+#property version     "5.51"
 #property strict
-#property description "vMoneixau v5.5 — H4 диапазон + M15 подтверждение зон + узкое окно NY-сессии + M5 вход + БУ/частичное закрытие/трейлинг + боковик-пауза"
+#property description "vMoneixau v5.51 — H4 рамка (зоны или max/min) + M15 подтверждение + окно NY + M5 вход + БУ/частичное закрытие/трейлинг"
 
 #include <Trade\Trade.mqh>
 #include <Trade\PositionInfo.mqh>
@@ -143,8 +169,29 @@ input int     InpH4LookbackBars     = 150;  // сколько H4-баров на
 input double  InpH4ZoneClusterPts   = 300;  // касания в пределах этого расстояния — одна зона
 input int     InpH4MinTouches       = 2;    // мин. касаний, чтобы зона считалась подтверждённой
 input double  InpZoneProximityPts   = 700;  // насколько близко цена должна быть к H4-зоне (было 150→400)
-input double  InpMaxRangeWidthPts   = 5000; // макс. ширина H4-диапазона — иначе это не реальный боковик (было 3000)
+// НАЙДЕНО (funnel-прогон за ГОД данных): лимит 5000 пт отсекал 92% всех
+// кандидатов — золото трендит, и коридор между ближней H4-поддержкой и
+// H4-сопротивлением почти всегда шире 5000. При этом реальную проверку
+// качества уровня теперь делает слой M15 (2-3 касания), а TP всё равно зажат
+// потолком InpMaxTPPts — широкий H4-коридор сам по себе не вредит. Поэтому
+// лимит поднят до 12000: H4 задаёт только макро-рамку "где максимум и
+// минимум" (как вы и описали), а не требование узкого боковика.
+// ОБНОВЛЕНО ещё раз (funnel-прогон с рамкой max/min): даже лимит 12000
+// отсекал ~73% оставшихся баров — 3-дневный ход золота обычно шире. Смысла в
+// лимите больше нет: TP зажат потолком InpMaxTPPts, SL — InpMaxSLPts, а вход
+// требует близости к краю рамки (InpZoneProximityPts). 0 = проверка выключена.
+input double  InpMaxRangeWidthPts   = 0;    // макс. ширина H4-диапазона, 0 = не проверять (было 5000→12000)
 input int     InpSwingConfirmCount  = 2;    // сколько последних свинг-хаев/лоу проверяем на направление
+// НАЙДЕНО (funnel-прогон за год): "подтверждённая зона сопротивления СВЕРХУ и
+// поддержки СНИЗУ" существовали одновременно лишь на ~10% баров окна сессии —
+// на хаях года выше цены физически нет подтверждённой зоны (цена там ещё не
+// была), и вход блокировался неделями. По вашему же описанию "по тайму 4 часа
+// видно где максимум и минимум": если зонного коридора нет, рамкой диапазона
+// становятся max/min последних InpHLRangeBars H4-баров (~3 дня). Приоритет у
+// настоящих зон с касаниями; max/min — запасной вариант, чтобы рамка была
+// всегда. Фильтры bias/MA/M15 при этом работают как обычно.
+input bool    InpUseHLFallbackRange = true;
+input int     InpHLRangeBars        = 18;   // H4-баров для запасной рамки max/min (18 = ~3 дня)
 
 input group "=== ШАГ 2: СЕССИЯ И ИНДИКАТОР 'ИМПУЛЬС' ==="
 // ИЗМЕНЕНО (по запросу): раньше InpSessionWindowMinutes=900 (15 часов) — это
@@ -173,8 +220,19 @@ input ENUM_MA_METHOD InpMAMethod    = MODE_SMA;
 // хотя реального разворота тренда не было. Добавлены буфер (цена должна
 // отойти от MA на ощутимое расстояние, не просто пересечь линию) и проверка
 // наклона MA (сама средняя должна расти/падать, а не быть плоской).
-input double  InpMABufferPts        = 50;   // мин. расстояние цены от MA, чтобы засчитать направление (было 0)
-input int     InpMASlopeBars        = 5;    // на скольки барах назад сравниваем MA для определения наклона
+// НАЙДЕНО (funnel-прогон за год): требование "цена выше MA+50пт И MA растёт"
+// ЛОГИЧЕСКИ ПРОТИВОРЕЧИТ фейду поддержки. Мы покупаем У ПОДДЕРЖКИ (низ
+// диапазона) — а там цена почти по определению ЕЩЁ НИЖЕ или только-только
+// у своей MA(50), и сама MA ещё падает (она разворачивается с запозданием).
+// Оба условия одновременно выполняются только при редчайшем резком V-развороте
+// — фильтр пропускал 9 баров из 22 за ГОД, а вместе с остальными — ноль
+// сделок. Исправление: буфер снижен до 20пт, а наклон MA сделан опциональным
+// (по умолчанию ВЫКЛ) — при пробое M5-зоны после отскока от поддержки цена
+// как раз успевает вернуться над MA, и это и есть ваш "импульс"; требовать
+// ещё и разворота самой полусотенной средней — значит опаздывать всегда.
+input double  InpMABufferPts        = 20;   // мин. расстояние цены от MA (было 50 — душило входы у зон)
+input bool    InpMARequireSlope     = false; // требовать ещё и наклон MA (было жёстко ON — опаздывает у зон)
+input int     InpMASlopeBars        = 5;    // на скольки барах назад сравниваем MA для наклона (если ON)
 
 input group "=== ШАГ 2b: ПОДТВЕРЖДЕНИЕ ЗОН НА M15 (по запросу — 'на 15 минут видно зоны ещё лучше') ==="
 // Добавлен средний слой между H4 (общий диапазон) и M5 (точка входа): те же
@@ -194,6 +252,18 @@ input int     InpLtfPivotLegBars    = 2;
 input int     InpLtfLookbackBars    = 150;  // M5-баров назад (~12.5 часов)
 input double  InpLtfZoneClusterPts  = 80;
 input int     InpLtfMinTouches      = 2;
+// НАЙДЕНО (funnel-прогон): формальный пробой M5-зоны (мин. 2 касания, кластер)
+// требует, чтобы рядом с текущей ценой УЖЕ сформировалась подтверждённая
+// M5-зона И чтобы её пробитие случилось ровно в момент, когда совпали все
+// остальные условия (узкое окно сессии!). На практике это отсекало вообще
+// всё. Добавлен запасной триггер в духе вашего же описания ("пробили
+// уровень на M5, свеча закрылась выше — подтверждение"): подтверждённое
+// ЗАКРЫТИЕ M5-свечи выше максимума (для лонга) / ниже минимума (для шорта)
+// последних InpSimpleBreakoutBars M5-баров — микропробой локальной структуры.
+// Основной зонный пробой остаётся приоритетным; запасной работает, когда
+// формальной зоны рядом просто нет.
+input bool    InpUseSimpleBreakout  = true;
+input int     InpSimpleBreakoutBars = 6;    // закрытие за экстремум последних N M5-баров (30 мин)
 
 input group "=== БОКОВИК: ПАУЗА ПЕРЕД ПОВТОРНЫМ СКАНОМ (по запросу) ==="
 // "Если боковик — пауза 30-60 минут, ждём коррекции." Как только на новом
@@ -336,6 +406,7 @@ string PANEL_PREFIX = "vMoneixau_";
 // (DrawPanel), чтобы не гадать, что именно блокирует вход — панель теперь
 // показывает результат КАЖДОГО шага живьём.
 bool     g_haveRange    = false;
+bool     g_rangeIsFallback = false; // рамка из max/min H4, а не из подтверждённых зон
 bool     g_rangeWidthOk = false;
 SRZone   g_curRes, g_curSup;
 int      g_swingBias   = 0;
@@ -1016,6 +1087,38 @@ bool TryLtfBreakout(int direction)
          }
       }
    }
+
+   // Запасной триггер (см. пояснение у InpUseSimpleBreakout): подтверждённое
+   // закрытие за экстремумом последних N M5-баров, когда формальной зоны с
+   // нужным числом касаний рядом не оказалось. Сканируем бары 2..N+1 — сам
+   // сигнальный бар (shift=1) в свой же экстремум не входит.
+   if(InpUseSimpleBreakout && InpSimpleBreakoutBars > 0)
+   {
+      if(direction == 1)
+      {
+         double hh = -DBL_MAX;
+         for(int s = 2; s <= InpSimpleBreakoutBars + 1; s++)
+            hh = MathMax(hh, iHigh(_Symbol, PERIOD_M5, s));
+         if(hh > -DBL_MAX && closePrice > hh)
+         {
+            g_lastSignalDetail = StringFormat("Микропробой: закрытие %.2f выше max последних %d M5-баров (%.2f)",
+                                               closePrice, InpSimpleBreakoutBars, hh);
+            return true;
+         }
+      }
+      else
+      {
+         double ll = DBL_MAX;
+         for(int s = 2; s <= InpSimpleBreakoutBars + 1; s++)
+            ll = MathMin(ll, iLow(_Symbol, PERIOD_M5, s));
+         if(ll < DBL_MAX && closePrice < ll)
+         {
+            g_lastSignalDetail = StringFormat("Микропробой: закрытие %.2f ниже min последних %d M5-баров (%.2f)",
+                                               closePrice, InpSimpleBreakoutBars, ll);
+            return true;
+         }
+      }
+   }
    return false;
 }
 
@@ -1221,6 +1324,16 @@ int OnInit()
       Print("❌ ERROR: InpSidewaysPauseMinutes должен быть > 0");
       return INIT_PARAMETERS_INCORRECT;
    }
+   if(InpUseHLFallbackRange && InpHLRangeBars <= 0)
+   {
+      Print("❌ ERROR: InpHLRangeBars должен быть > 0 при включённой запасной рамке");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+   if(InpUseSimpleBreakout && InpSimpleBreakoutBars <= 0)
+   {
+      Print("❌ ERROR: InpSimpleBreakoutBars должен быть > 0 при включённом микропробое");
+      return INIT_PARAMETERS_INCORRECT;
+   }
    if(InpTPAtOppositeZonePct <= 0.0 || InpTPAtOppositeZonePct > 100.0)
    {
       Print("❌ ERROR: InpTPAtOppositeZonePct должен быть в (0,100]");
@@ -1236,9 +1349,9 @@ int OnInit()
       Print("❌ ERROR: InpMaxSLPts должен быть > 0");
       return INIT_PARAMETERS_INCORRECT;
    }
-   if(InpMaxRangeWidthPts <= 0)
+   if(InpMaxRangeWidthPts < 0)
    {
-      Print("❌ ERROR: InpMaxRangeWidthPts должен быть > 0");
+      Print("❌ ERROR: InpMaxRangeWidthPts не может быть отрицательным (0 = проверка выключена)");
       return INIT_PARAMETERS_INCORRECT;
    }
    if(InpUseStallExit && (InpStallUpperRefPts <= InpMinTPPts || InpStallMinMinutes <= 0 || InpStallMaxMinutes <= 0))
@@ -1438,21 +1551,54 @@ void OnTick()
 
    double curPrice = (SymbolInfoDouble(_Symbol, SYMBOL_BID) + SymbolInfoDouble(_Symbol, SYMBOL_ASK)) / 2.0;
    g_haveRange = GetActiveRange(g_h4Zones, curPrice, g_curRes, g_curSup);
+   g_rangeIsFallback = false;
+
+   // Запасная рамка "максимум/минимум H4" (см. пояснение у InpUseHLFallbackRange):
+   // подтверждённый зонный коридор в тренде часто не существует (нет зоны выше
+   // цены на хаях) — тогда рамкой становятся max/min последних InpHLRangeBars
+   // завершённых H4-баров. Толщина синтетической зоны = InpH4ZoneClusterPts.
+   if(!g_haveRange && InpUseHLFallbackRange && InpHLRangeBars > 0)
+   {
+      double hh = -DBL_MAX, ll = DBL_MAX;
+      for(int b = 1; b <= InpHLRangeBars; b++)
+      {
+         double bh = iHigh(_Symbol, PERIOD_H4, b);
+         double bl = iLow(_Symbol, PERIOD_H4, b);
+         if(bh > 0.0) hh = MathMax(hh, bh);
+         if(bl > 0.0) ll = MathMin(ll, bl);
+      }
+      if(hh > -DBL_MAX && ll < DBL_MAX && hh > curPrice && ll < curPrice)
+      {
+         double zw = InpH4ZoneClusterPts * SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+         g_curRes.hi = hh; g_curRes.lo = hh - zw; g_curRes.touches = 1;
+         g_curRes.isResistance = true;  g_curRes.anchor = hh;
+         g_curSup.lo = ll; g_curSup.hi = ll + zw; g_curSup.touches = 1;
+         g_curSup.isResistance = false; g_curSup.anchor = ll;
+         g_haveRange = true;
+         g_rangeIsFallback = true;
+      }
+   }
 
    // "Если боковик — пауза 30-60 минут, ждём коррекции" — проверяем ровно
    // когда H4-структура пересчиталась (раз в 4 часа), а не на каждом тике.
-   if(isNewH4Bar && (!g_haveRange || g_swingBias == 0))
+   // НАЙДЕНО (funnel-прогон): первая версия ставила паузу ещё и при
+   // g_swingBias==0 — но нейтральная структура свингов ВХОД НЕ БЛОКИРУЕТ
+   // (CheckEntry разрешает bias>=0 для лонга и bias<=0 для шорта), а H4-бар
+   // открывается ровно в 16:00 — пауза до 16:45 съедала 45 из 60 минут
+   // вашего окна входа 16:30-17:30 почти каждый день. Теперь пауза только
+   // когда диапазона нет ВООБЩЕ (реально нечего сканировать).
+   if(isNewH4Bar && !g_haveRange)
    {
       g_scanPauseUntil = TimeCurrent() + (long)InpSidewaysPauseMinutes * 60;
-      Print("💤 Боковик (диапазон=", (g_haveRange?"есть":"нет"), " bias=", g_swingBias,
-            ") — пауза сканирования входов на ", InpSidewaysPauseMinutes, " мин");
+      Print("💤 Нет H4-диапазона — пауза сканирования входов на ", InpSidewaysPauseMinutes, " мин");
    }
    g_sidewaysPaused = (TimeCurrent() < g_scanPauseUntil);
 
    double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
    if(g_haveRange)
    {
-      g_rangeWidthOk   = (g_curRes.lo - g_curSup.hi) / point <= InpMaxRangeWidthPts;
+      g_rangeWidthOk   = (InpMaxRangeWidthPts <= 0.0) ||
+                         ((g_curRes.lo - g_curSup.hi) / point <= InpMaxRangeWidthPts);
       g_nearSupport    = (curPrice >= g_curSup.lo) && ((curPrice - g_curSup.hi) / point <= InpZoneProximityPts);
       g_nearResistance = (curPrice <= g_curRes.hi) && ((g_curRes.lo - curPrice) / point <= InpZoneProximityPts);
    }
@@ -1468,17 +1614,26 @@ void OnTick()
    // словам, касания видно ещё чётче). Требуем близость к M15-зоне с
    // накопленными InpM15MinTouches касаниями — это и есть "два-три
    // подтверждения" разворота в этом месте.
-   SRZone m15Res, m15Sup;
-   bool haveM15Range = GetActiveRange(g_m15Zones, curPrice, m15Res, m15Sup);
-   if(haveM15Range)
+   //
+   // НАЙДЕНО (funnel-прогон): первая версия искала M15-поддержку СТРОГО НИЖЕ
+   // цены (через GetActiveRange) — но у H4-поддержки цена стоит на локальном
+   // минимуме, и M15-зона, от которой отбиваемся, лежит ВОКРУГ цены, а не под
+   // ней. Проверка исключала ровно ту зону, которую должна была подтверждать
+   // (13 кандидатов за год → 3). Теперь ищем ближайшую M15-зону нужного типа,
+   // до края которой не дальше InpM15ZoneProximityPts — включая случай, когда
+   // цена ВНУТРИ зоны.
+   g_m15ConfirmSupport = false;
+   g_m15ConfirmResistance = false;
+   for(int zi = 0; zi < ArraySize(g_m15Zones); zi++)
    {
-      g_m15ConfirmSupport    = (curPrice - m15Sup.hi) / point <= InpM15ZoneProximityPts && m15Sup.touches >= InpM15MinTouches;
-      g_m15ConfirmResistance = (m15Res.lo - curPrice) / point <= InpM15ZoneProximityPts && m15Res.touches >= InpM15MinTouches;
-   }
-   else
-   {
-      g_m15ConfirmSupport = false;
-      g_m15ConfirmResistance = false;
+      if(g_m15Zones[zi].touches < InpM15MinTouches) continue;
+      double distPts;
+      if(curPrice < g_m15Zones[zi].lo)      distPts = (g_m15Zones[zi].lo - curPrice) / point;
+      else if(curPrice > g_m15Zones[zi].hi) distPts = (curPrice - g_m15Zones[zi].hi) / point;
+      else                                   distPts = 0.0; // цена внутри зоны
+      if(distPts > InpM15ZoneProximityPts) continue;
+      if(g_m15Zones[zi].isResistance) g_m15ConfirmResistance = true;
+      else                            g_m15ConfirmSupport = true;
    }
 
    // Буфер + наклон (см. пояснение у InpMABufferPts выше) — без этого мелкий
@@ -1492,8 +1647,11 @@ void OnTick()
       double buffer = InpMABufferPts * point;
       bool maRising  = maNow > maPrev;
       bool maFalling = maNow < maPrev;
-      g_maLong  = (curPrice > maNow + buffer) && maRising;
-      g_maShort = (curPrice < maNow - buffer) && maFalling;
+      // Наклон MA — опционально (см. пояснение у InpMARequireSlope): у зоны
+      // поддержки/сопротивления MA(50) разворачивается позже цены, жёсткое
+      // требование наклона делало лонг у поддержки практически невозможным.
+      g_maLong  = (curPrice > maNow + buffer) && (!InpMARequireSlope || maRising);
+      g_maShort = (curPrice < maNow - buffer) && (!InpMARequireSlope || maFalling);
    }
    else
    {
@@ -1627,13 +1785,22 @@ void DrawPanel()
    {
       double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
       double widthPts = (g_curRes.lo - g_curSup.hi) / point;
-      texts[n] = StringFormat("Сопротивление: %.2f-%.2f (%d кас.)", g_curRes.lo, g_curRes.hi, g_curRes.touches);
+      string srcTag = g_rangeIsFallback ? " [по max/min H4]" : "";
+      texts[n] = StringFormat("Сопротивление: %.2f-%.2f (%d кас.)%s", g_curRes.lo, g_curRes.hi, g_curRes.touches, srcTag);
       colors[n] = InpColorBad; n++;
-      texts[n] = StringFormat("Поддержка: %.2f-%.2f (%d кас.)", g_curSup.lo, g_curSup.hi, g_curSup.touches);
+      texts[n] = StringFormat("Поддержка: %.2f-%.2f (%d кас.)%s", g_curSup.lo, g_curSup.hi, g_curSup.touches, srcTag);
       colors[n] = InpColorGood; n++;
-      texts[n] = StringFormat("Ширина: %.0fпт %s (лимит %.0f)", widthPts,
-                               g_rangeWidthOk ? "✅" : "❌ слишком широко", InpMaxRangeWidthPts);
-      colors[n] = g_rangeWidthOk ? InpColorGood : InpColorBad; n++;
+      if(InpMaxRangeWidthPts > 0.0)
+      {
+         texts[n] = StringFormat("Ширина: %.0fпт %s (лимит %.0f)", widthPts,
+                                  g_rangeWidthOk ? "✅" : "❌ слишком широко", InpMaxRangeWidthPts);
+         colors[n] = g_rangeWidthOk ? InpColorGood : InpColorBad; n++;
+      }
+      else
+      {
+         texts[n] = StringFormat("Ширина: %.0fпт (лимит выключен)", widthPts);
+         colors[n] = InpColorNeutral; n++;
+      }
    }
    else
    {
