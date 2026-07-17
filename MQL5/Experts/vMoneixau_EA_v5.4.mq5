@@ -93,10 +93,30 @@
 //| убытка и защитить часть прибыли на сделках, которые успели уйти в  |
 //| плюс, а не убрать убытки полностью.                                |
 //+------------------------------------------------------------------+
-#property copyright   "vMoneixau v5.4 — новая стратегия, требует проверки в тестере"
-#property version     "5.41"
+//+------------------------------------------------------------------+
+//| v5.5 — ПЕРЕРАБОТКА СЕССИИ/ЗОН ПО ЗАПРОСУ:                          |
+//| 1) Окно ВХОДА сужено с 900 мин (диагностический костыль v5.4) до   |
+//|    InpSessionWindowMinutes=60 (40-90 по вашему описанию) — сделки  |
+//|    ловим у открытия NY-сессии, пока виден свежий тренд, а не весь  |
+//|    день напролёт.                                                 |
+//| 2) Добавлен InpTradingEndHour/Minute=22:00 — уже открытая позиция  |
+//|    управляется как обычно (БУ/частичное закрытие/трейлинг/         |
+//|    стагнация), но принудительно закрывается к этому часу           |
+//|    независимо от InpMaxHoldMinutes — "торги до 22:00 по Кишинёву". |
+//| 3) Добавлен ШАГ 2b — подтверждение зон на M15 (между H4-диапазоном |
+//|    и M5-точкой входа): требуем близость к M15-зоне с накопленными  |
+//|    InpM15MinTouches (2-3) касаниями — ваши "два-три подтверждения, |
+//|    что цена доходит до вершины и разворачивается".                 |
+//| 4) Добавлена боковик-пауза (InpSidewaysPauseMinutes=45, 30-60 по   |
+//|    запросу): если на новом H4-баре не нашлось диапазона или        |
+//|    структура свингов не даёт направления — сканирование новых      |
+//|    входов приостанавливается на это время вместо непрерывной       |
+//|    проверки каждую M5-свечу.                                       |
+//+------------------------------------------------------------------+
+#property copyright   "vMoneixau v5.5 — новая стратегия, требует проверки в тестере"
+#property version     "5.50"
 #property strict
-#property description "vMoneixau v5.4 — H4 зоны + структура свингов + сессия/MA + M5 пробой + согласие импульса + БУ/частичное закрытие/трейлинг"
+#property description "vMoneixau v5.5 — H4 диапазон + M15 подтверждение зон + узкое окно NY-сессии + M5 вход + БУ/частичное закрытие/трейлинг + боковик-пауза"
 
 #include <Trade\Trade.mqh>
 #include <Trade\PositionInfo.mqh>
@@ -127,9 +147,22 @@ input double  InpMaxRangeWidthPts   = 5000; // макс. ширина H4-диа�
 input int     InpSwingConfirmCount  = 2;    // сколько последних свинг-хаев/лоу проверяем на направление
 
 input group "=== ШАГ 2: СЕССИЯ И ИНДИКАТОР 'ИМПУЛЬС' ==="
-input int     InpSessionStartHour   = 16;   // начало торгового окна (время сервера — настройте под NY-открытие у вашего брокера)
+// ИЗМЕНЕНО (по запросу): раньше InpSessionWindowMinutes=900 (15 часов) — это
+// было расширено ИСКУССТВЕННО в v5.4, чтобы просто получить хоть какие-то
+// сделки для диагностики. Теперь по вашему описанию — вход должен ловиться
+// именно в начале Нью-Йоркской сессии, когда рынок уже "сформировался" и
+// виден тренд, а не в течение всего дня: узкое окно ВХОДА 40-90 минут после
+// открытия сессии. Отдельно — InpTradingEndHour/Minute: сколько бы ни шла
+// сделка, она принудительно закрывается к 22:00 по Кишинёву (уже открытая
+// позиция при этом продолжает управляться безубытком/трейлингом/стагнацией
+// как обычно — просто не позже этого времени). Если время сервера вашего
+// брокера НЕ совпадает с временем Кишинёва (EEST/EET) — сдвиньте оба времени
+// (старт сессии и конец торгового дня) на ту же разницу.
+input int     InpSessionStartHour   = 16;   // начало окна входа (время сервера — настройте под NY-открытие у вашего брокера)
 input int     InpSessionStartMinute = 30;
-input int     InpSessionWindowMinutes = 900; // сколько минут после старта окна ищем сделки (было 240→600)
+input int     InpSessionWindowMinutes = 60;  // окно ВХОДА в минутах после старта сессии (было 900 — диагностика; теперь 40-90 по запросу)
+input int     InpTradingEndHour     = 22;   // жёсткое закрытие любой открытой сделки к этому часу (по Кишинёву, если сервер = Кишинёв)
+input int     InpTradingEndMinute   = 0;
 input bool    InpSkipFirstCandle    = true; // не входить на первой M5-свече после открытия окна
 input int     InpMAPeriod           = 50;   // период индикатора "Импульс" (обычная MA)
 input ENUM_MA_METHOD InpMAMethod    = MODE_SMA;
@@ -143,11 +176,33 @@ input ENUM_MA_METHOD InpMAMethod    = MODE_SMA;
 input double  InpMABufferPts        = 50;   // мин. расстояние цены от MA, чтобы засчитать направление (было 0)
 input int     InpMASlopeBars        = 5;    // на скольки барах назад сравниваем MA для определения наклона
 
+input group "=== ШАГ 2b: ПОДТВЕРЖДЕНИЕ ЗОН НА M15 (по запросу — 'на 15 минут видно зоны ещё лучше') ==="
+// Добавлен средний слой между H4 (общий диапазон) и M5 (точка входа): те же
+// зоны поддержки/сопротивления, но на M15, где, по вашим словам, касания
+// видно отчётливее. Перед входом требуем, чтобы цена была ещё и рядом с
+// M15-зоной ТОЙ ЖЕ стороны (поддержка/сопротивление), причём у этой M15-зоны
+// накопилось хотя бы InpM15MinTouches касаний — это и есть ваши "два или три
+// подтверждения, что цена в этом месте доходит до вершины и разворачивается".
+input int     InpM15PivotLegBars    = 2;
+input int     InpM15LookbackBars    = 150;  // M15-баров назад (~37 часов)
+input double  InpM15ZoneClusterPts  = 150;
+input int     InpM15MinTouches      = 2;    // 2 или 3 подтверждения касания зоны, как вы и просили
+input double  InpM15ZoneProximityPts = 300; // насколько близко цена должна быть к M15-зоне для подтверждения
+
 input group "=== ШАГ 3-4: ЗОНЫ НА M5 + ПРОБОЙ С ПОДТВЕРЖДЁННЫМ ЗАКРЫТИЕМ ==="
 input int     InpLtfPivotLegBars    = 2;
 input int     InpLtfLookbackBars    = 150;  // M5-баров назад (~12.5 часов)
 input double  InpLtfZoneClusterPts  = 80;
 input int     InpLtfMinTouches      = 2;
+
+input group "=== БОКОВИК: ПАУЗА ПЕРЕД ПОВТОРНЫМ СКАНОМ (по запросу) ==="
+// "Если боковик — пауза 30-60 минут, ждём коррекции." Как только на новом
+// H4-баре выясняется, что диапазон не найден ИЛИ структура свингов не даёт
+// направления (боковик, а не тренд), сканирование новых входов
+// приостанавливается на InpSidewaysPauseMinutes — вместо того чтобы дёргать
+// проверку входа на каждой M5-свече без толку. Уже открытые позиции пауза не
+// затрагивает — ими управление (безубыток/трейлинг/стагнация) идёт как обычно.
+input int     InpSidewaysPauseMinutes = 45; // 30-60 по вашему запросу
 
 input group "=== СОГЛАСИЕ НЕДАВНЕГО ИМПУЛЬСА (v5.4, по запросу) ==="
 // "Определять направление рынка и открывать позицию ПО направлению рынка".
@@ -249,12 +304,16 @@ struct SRZone
 
 SwingPoint g_h4Swings[];
 SRZone     g_h4Zones[];
+SwingPoint g_m15Swings[];
+SRZone     g_m15Zones[];
 SwingPoint g_ltfSwings[];
 SRZone     g_ltfZones[];
 
 datetime g_last_h4_bar   = 0;
+datetime g_last_m15_bar  = 0;
 datetime g_last_ltf_bar  = 0;
 datetime g_last_day      = 0;
+datetime g_scanPauseUntil = 0; // "боковик" — сканирование новых входов приостановлено до этого момента
 
 int      g_magicLong  = 0;
 int      g_magicShort = 0;
@@ -283,6 +342,8 @@ int      g_swingBias   = 0;
 bool     g_maLong = false, g_maShort = false;
 bool     g_inSession = false;
 bool     g_nearSupport = false, g_nearResistance = false;
+bool     g_m15ConfirmSupport = false, g_m15ConfirmResistance = false;
+bool     g_sidewaysPaused = false;
 string   g_lastSignalDetail = "";
 
 struct PosPnlEntry  { ulong posId; double pnl; };
@@ -765,6 +826,22 @@ void ManageOpenPositions(bool isNewLtfBar)
          continue;
       }
 
+      // "Торги до 22:00 по Кишинёву" — независимо от того, сколько уже длится
+      // сделка и что показывает InpMaxHoldMinutes, к этому часу (время сервера)
+      // позиция закрывается принудительно.
+      {
+         MqlDateTime nowDt;
+         TimeToStruct(now, nowDt);
+         int nowHM = nowDt.hour * 60 + nowDt.min;
+         int endHM = InpTradingEndHour * 60 + InpTradingEndMinute;
+         if(nowHM >= endHM)
+         {
+            if(trade.PositionClose(ticket))
+               Print("🌙 Закрыто по концу торгового дня (", StringFormat("%02d:%02d", InpTradingEndHour, InpTradingEndMinute), "): тикет ", ticket);
+            continue;
+         }
+      }
+
       // --- Безубыток / частичное закрытие / трейлинг (перенесено из v4.9) ---
       {
          ENUM_POSITION_TYPE type = posInfo.PositionType();
@@ -1042,12 +1119,13 @@ void CheckEntry()
 {
    if(g_trading_paused) return;
    if(HasOpenPosition()) return;
+   if(g_sidewaysPaused) return; // боковик — ждём коррекцию (см. InpSidewaysPauseMinutes)
    if(!g_inSession) return;
    if(!g_haveRange) return;
    if(!g_rangeWidthOk) return; // не реальный боковик, а два далёких старых уровня
 
-   bool wantLong  = g_nearSupport    && (g_swingBias >= 0) && g_maLong;
-   bool wantShort = g_nearResistance && (g_swingBias <= 0) && g_maShort;
+   bool wantLong  = g_nearSupport    && (g_swingBias >= 0) && g_maLong  && g_m15ConfirmSupport;
+   bool wantShort = g_nearResistance && (g_swingBias <= 0) && g_maShort && g_m15ConfirmResistance;
 
    if(!SpreadOK()) return;
    if(!CalendarClear()) return;
@@ -1121,6 +1199,26 @@ int OnInit()
    if(InpSessionWindowMinutes <= 0)
    {
       Print("❌ ERROR: InpSessionWindowMinutes должен быть > 0");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+   if(InpTradingEndHour < 0 || InpTradingEndHour > 23 || InpTradingEndMinute < 0 || InpTradingEndMinute > 59)
+   {
+      Print("❌ ERROR: InpTradingEndHour/Minute вне диапазона");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+   if(InpM15PivotLegBars <= 0 || InpM15LookbackBars <= 0)
+   {
+      Print("❌ ERROR: InpM15PivotLegBars/InpM15LookbackBars должны быть > 0");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+   if(InpM15MinTouches < 1)
+   {
+      Print("❌ ERROR: InpM15MinTouches должен быть ≥ 1");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+   if(InpSidewaysPauseMinutes <= 0)
+   {
+      Print("❌ ERROR: InpSidewaysPauseMinutes должен быть > 0");
       return INIT_PARAMETERS_INCORRECT;
    }
    if(InpTPAtOppositeZonePct <= 0.0 || InpTPAtOppositeZonePct > 100.0)
@@ -1201,8 +1299,10 @@ int OnInit()
    CopyBuffer(h_ma, 0, 0, 300, tmp);
 
    g_last_h4_bar  = 0;
+   g_last_m15_bar = 0;
    g_last_ltf_bar = 0;
    g_last_day     = 0;
+   g_scanPauseUntil = 0;
    g_consecutive_losses = 0;
    g_trading_paused = false;
 
@@ -1221,14 +1321,18 @@ int OnInit()
    Print("vMoneixau v5.4 запущен | magic LONG=", g_magicLong, " SHORT=", g_magicShort);
    Print("Шаг 1: H4 зоны (leg=", InpH4PivotLegBars, " lookback=", InpH4LookbackBars,
          " кластер=", InpH4ZoneClusterPts, "пт мин.касаний=", InpH4MinTouches, ")");
-   Print("Шаг 2: сессия ", StringFormat("%02d:%02d", InpSessionStartHour, InpSessionStartMinute),
+   Print("Шаг 2: окно ВХОДА ", StringFormat("%02d:%02d", InpSessionStartHour, InpSessionStartMinute),
          " + ", InpSessionWindowMinutes, " мин, пропуск первой свечи: ", (InpSkipFirstCandle?"ON":"OFF"),
          ", MA(", InpMAPeriod, ") с буфером ", InpMABufferPts, "пт и наклоном за ", InpMASlopeBars,
          " баров как фильтр направления");
+   Print("Шаг 2b: M15 подтверждение (leg=", InpM15PivotLegBars, " lookback=", InpM15LookbackBars,
+         " кластер=", InpM15ZoneClusterPts, "пт мин.касаний=", InpM15MinTouches, ")");
    Print("Шаг 3-4: M5 зоны (leg=", InpLtfPivotLegBars, " lookback=", InpLtfLookbackBars,
          " кластер=", InpLtfZoneClusterPts, "пт) — вход по подтверждённому закрытию за зоной");
    Print("SL буфер: ", InpSLBufferPts, "пт | TP на ", InpTPAtOppositeZonePct, "% пути до противоположной зоны");
-   Print("Макс. удержание сделки: ", InpMaxHoldMinutes, " мин");
+   Print("Макс. удержание сделки: ", InpMaxHoldMinutes, " мин | конец торгового дня: ",
+         StringFormat("%02d:%02d", InpTradingEndHour, InpTradingEndMinute));
+   Print("Боковик-пауза: ", InpSidewaysPauseMinutes, " мин");
    Print("Безубыток: ", (InpUseBreakEven ? "ON" : "OFF"),
          " | Частичное закрытие: ", (InpUsePartialClose ? "ON" : "OFF"),
          " | Трейлинг: ", (InpUseTrailingStop ? "ON" : "OFF"));
@@ -1306,12 +1410,22 @@ void OnTick()
 
    // --- Шаг 1: пересчёт H4 зон и структуры свингов раз за H4-бар ---
    datetime curH4Bar = iTime(_Symbol, PERIOD_H4, 0);
-   if(curH4Bar != g_last_h4_bar)
+   bool isNewH4Bar = (curH4Bar != g_last_h4_bar);
+   if(isNewH4Bar)
    {
       g_last_h4_bar = curH4Bar;
       DetectSwings(PERIOD_H4, InpH4PivotLegBars, InpH4LookbackBars, g_h4Swings);
       ClusterZones(g_h4Swings, InpH4ZoneClusterPts, InpH4MinTouches, g_h4Zones);
       g_swingBias = GetSwingTrendBias(g_h4Swings, InpSwingConfirmCount);
+   }
+
+   // --- Шаг 2b: пересчёт M15 зон раз за M15-бар (подтверждение, см. вход. параметры) ---
+   datetime curM15Bar = iTime(_Symbol, PERIOD_M15, 0);
+   if(curM15Bar != g_last_m15_bar)
+   {
+      g_last_m15_bar = curM15Bar;
+      DetectSwings(PERIOD_M15, InpM15PivotLegBars, InpM15LookbackBars, g_m15Swings);
+      ClusterZones(g_m15Swings, InpM15ZoneClusterPts, InpM15MinTouches, g_m15Zones);
    }
 
    // --- Шаг 3: пересчёт M5 зон раз за M5-бар ---
@@ -1325,6 +1439,16 @@ void OnTick()
    double curPrice = (SymbolInfoDouble(_Symbol, SYMBOL_BID) + SymbolInfoDouble(_Symbol, SYMBOL_ASK)) / 2.0;
    g_haveRange = GetActiveRange(g_h4Zones, curPrice, g_curRes, g_curSup);
 
+   // "Если боковик — пауза 30-60 минут, ждём коррекции" — проверяем ровно
+   // когда H4-структура пересчиталась (раз в 4 часа), а не на каждом тике.
+   if(isNewH4Bar && (!g_haveRange || g_swingBias == 0))
+   {
+      g_scanPauseUntil = TimeCurrent() + (long)InpSidewaysPauseMinutes * 60;
+      Print("💤 Боковик (диапазон=", (g_haveRange?"есть":"нет"), " bias=", g_swingBias,
+            ") — пауза сканирования входов на ", InpSidewaysPauseMinutes, " мин");
+   }
+   g_sidewaysPaused = (TimeCurrent() < g_scanPauseUntil);
+
    double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
    if(g_haveRange)
    {
@@ -1337,6 +1461,24 @@ void OnTick()
       g_rangeWidthOk = false;
       g_nearSupport = false;
       g_nearResistance = false;
+   }
+
+   // Шаг 2b: подтверждение на M15 — та же сторона (поддержка/сопротивление),
+   // что и на H4, но с независимой кластеризацией на M15 (там, по вашим
+   // словам, касания видно ещё чётче). Требуем близость к M15-зоне с
+   // накопленными InpM15MinTouches касаниями — это и есть "два-три
+   // подтверждения" разворота в этом месте.
+   SRZone m15Res, m15Sup;
+   bool haveM15Range = GetActiveRange(g_m15Zones, curPrice, m15Res, m15Sup);
+   if(haveM15Range)
+   {
+      g_m15ConfirmSupport    = (curPrice - m15Sup.hi) / point <= InpM15ZoneProximityPts && m15Sup.touches >= InpM15MinTouches;
+      g_m15ConfirmResistance = (m15Res.lo - curPrice) / point <= InpM15ZoneProximityPts && m15Res.touches >= InpM15MinTouches;
+   }
+   else
+   {
+      g_m15ConfirmSupport = false;
+      g_m15ConfirmResistance = false;
    }
 
    // Буфер + наклон (см. пояснение у InpMABufferPts выше) — без этого мелкий
@@ -1517,10 +1659,17 @@ void DrawPanel()
    texts[n] = StringFormat("MA(%d) согласна: %s", InpMAPeriod,
                             (g_maLong || g_maShort) ? (g_maLong ? "✅ (лонг)" : "✅ (шорт)") : "❌");
    colors[n] = (g_maLong || g_maShort) ? InpColorGood : InpColorBad; n++;
-   texts[n] = StringFormat("Сессия активна: %s", g_inSession ? "✅" : "❌");
+   texts[n] = StringFormat("M15 подтверждение: у поддержки %s | у сопротивления %s",
+                            g_m15ConfirmSupport ? "✅" : "❌", g_m15ConfirmResistance ? "✅" : "❌");
+   colors[n] = (g_m15ConfirmSupport || g_m15ConfirmResistance) ? InpColorGood : InpColorBad; n++;
+   texts[n] = StringFormat("Окно входа (сессия) активно: %s", g_inSession ? "✅" : "❌");
    colors[n] = g_inSession ? InpColorGood : InpColorBad; n++;
-   bool readyLong  = g_haveRange && g_rangeWidthOk && g_nearSupport    && (g_swingBias >= 0) && g_maLong  && g_inSession;
-   bool readyShort = g_haveRange && g_rangeWidthOk && g_nearResistance && (g_swingBias <= 0) && g_maShort && g_inSession;
+   texts[n] = StringFormat("Боковик-пауза: %s", g_sidewaysPaused
+                            ? StringFormat("⏸ ещё %d мин", (int)MathMax(0, (g_scanPauseUntil - TimeCurrent()) / 60))
+                            : "✅ нет паузы");
+   colors[n] = g_sidewaysPaused ? InpColorBad : InpColorGood; n++;
+   bool readyLong  = g_haveRange && g_rangeWidthOk && g_nearSupport    && (g_swingBias >= 0) && g_maLong  && g_m15ConfirmSupport    && g_inSession && !g_sidewaysPaused;
+   bool readyShort = g_haveRange && g_rangeWidthOk && g_nearResistance && (g_swingBias <= 0) && g_maShort && g_m15ConfirmResistance && g_inSession && !g_sidewaysPaused;
    if(readyLong || readyShort)
    {
       texts[n] = StringFormat("Все условия ОК (%s) — ждём пробой M5-зоны", readyLong ? "ЛОНГ" : "ШОРТ");
@@ -1530,6 +1679,8 @@ void DrawPanel()
    {
       texts[n] = "Не все условия совпали — сделка невозможна прямо сейчас"; colors[n] = InpColorNeutral; n++;
    }
+   texts[n] = StringFormat("Торговый день до %02d:%02d (сервер)", InpTradingEndHour, InpTradingEndMinute);
+   colors[n] = InpColorNeutral; n++;
    texts[n] = ""; colors[n] = InpColorText; n++;
 
    texts[n] = "─── ШАГ 3-4: M5 ЗОНЫ И СИГНАЛ ───"; colors[n] = InpColorHeader; n++;
