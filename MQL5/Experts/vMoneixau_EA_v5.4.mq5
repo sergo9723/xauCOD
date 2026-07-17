@@ -139,10 +139,28 @@
 //| Итог зеркального прогона за год: 0 сделок → 4 (3 в плюс, +498 пт);  |
 //| реальный M5 в тестере даст больше (зеркало на M15 в 3 раза грубее). |
 //+------------------------------------------------------------------+
-#property copyright   "vMoneixau v5.51 — новая стратегия, требует проверки в тестере"
-#property version     "5.51"
+//+------------------------------------------------------------------+
+//| v5.52 — ЗАМОК ПРИБЫЛИ + более редкие/точные входы (по запросу      |
+//| "минимум сделок в день, очень точные, закрывались минимум в плюс   |
+//| 50; если цена долго стоит в плюсе — закрыть, чтобы не развернуло    |
+//| в стоп"):                                                          |
+//| • Добавлен ЗАМОК ПРИБЫЛИ (InpUseProfitLock) — проверяется КАЖДЫЙ    |
+//|   ТИК: как только плавающая прибыль достигла +70, ставится         |
+//|   плавающий пол max(+50, пик−25); откат до пола → закрытие В ПЛЮСЕ  |
+//|   немедленно, не дожидаясь разворота в стоп. Пол не опускается ниже |
+//|   +50 (ваш минимум).                                               |
+//| • StallExit ускорен: терпение к мелкой прибыли 30→12 мин — мелкий   |
+//|   плюс банкуется быстрее, пока не развернулся.                     |
+//| • Входы остаются РЕДКИМИ и точными (узкое окно NY-сессии + bias +   |
+//|   MA + M15-подтверждение 2-3 касаний + пробой M5 + перевес свечей). |
+//| Прогон логики за год (M15-зеркало, грубее реального M5): без        |
+//|   ошибок, редкие сделки с защищённым плюсом. Реальную частоту и     |
+//|   исполнение замка проверяйте в MT5 Strategy Tester на M5.          |
+//+------------------------------------------------------------------+
+#property copyright   "vMoneixau v5.52 — новая стратегия, требует проверки в тестере"
+#property version     "5.52"
 #property strict
-#property description "vMoneixau v5.51 — H4 рамка (зоны или max/min) + M15 подтверждение + окно NY + M5 вход + БУ/частичное закрытие/трейлинг"
+#property description "vMoneixau v5.52 — редкие точные входы + замок прибыли (мин. +50, защита от разворота) + БУ/частичное/трейлинг/стагнация"
 
 #include <Trade\Trade.mqh>
 #include <Trade\PositionInfo.mqh>
@@ -325,8 +343,26 @@ input group "=== ДИНАМИЧЕСКАЯ ФИКСАЦИЯ ПРИБЫЛИ ПРИ
 input bool    InpUseStallExit       = true;
 input double  InpStallUpperRefPts   = 800;  // верхняя граница "прыгает от 50 до 800"
 input int     InpStallMinMinutes    = 5;    // требуемая стагнация при прибыли ~InpStallUpperRefPts
-input int     InpStallMaxMinutes    = 30;   // требуемая стагнация при прибыли ~InpMinTPPts
+input int     InpStallMaxMinutes    = 12;   // требуемая стагнация при прибыли ~InpMinTPPts (было 30 — банкуем +50 быстрее)
 input double  InpStallEpsilonPts    = 20;   // допуск на шум для "новый пик"
+
+input group "=== ЗАМОК ПРИБЫЛИ (по запросу: закрыть в плюс, не дать развернуться в стоп) ==="
+// "Закрывались минимум в плюс 50 пунктов; если цена долго стоит в плюсе — нужно
+// закрывать, чтобы не было разворота и не выкинуло по стопам." В отличие от
+// StallExit (закрывает по ВРЕМЕНИ простоя) этот замок закрывает по ОТКАТУ от
+// пика прибыли — он проверяется НА КАЖДОМ ТИКЕ, поэтому реагирует на разворот
+// сразу, а не через минуты. Как только плавающая прибыль хоть раз достигла
+// InpProfitLockActivatePts, ставится "плавающий пол": max(InpProfitLockFloorPts,
+// пик − InpProfitLockGiveBackPts). Если прибыль откатывается до этого пола —
+// закрываемся В ПЛЮСЕ немедленно, не дожидаясь, пока разворот съест профит и
+// уведёт в стоп. Пол НИКОГДА не опускается ниже InpProfitLockFloorPts (ваше
+// "минимум +50"). ВАЖНО: замок работает только ПОСЛЕ того как прибыль
+// достигла порога активации — если цена сразу пошла против входа и профита не
+// было вовсе, замок не поможет (это защищает прибыль, а не отменяет убыток).
+input bool    InpUseProfitLock         = true;
+input double  InpProfitLockActivatePts = 70;  // с какого пика прибыли включается замок
+input double  InpProfitLockGiveBackPts = 25;  // сколько пунктов от пика позволяем отдать до закрытия
+input double  InpProfitLockFloorPts    = 50;  // плавающий пол не опускается ниже (минимум +50 пт)
 
 input group "=== ЗАЩИТА КАПИТАЛА ==="
 input int     InpMaxConsecutiveLosses = 3;
@@ -422,7 +458,7 @@ PosPnlEntry g_posPnl[];
 
 // Для динамической фиксации прибыли при стагнации (StallExit) + перенесённое
 // из v4.9 состояние безубытка/частичного закрытия (одна позиция — одна запись).
-struct PosStallState { ulong posId; double peakPts; datetime peakTime; bool beDone; bool partialDone; };
+struct PosStallState { ulong posId; double peakPts; datetime peakTime; bool beDone; bool partialDone; double lockPeakPts; };
 PosStallState g_posStall[];
 
 int GetOrCreateStall(ulong posId)
@@ -436,6 +472,7 @@ int GetOrCreateStall(ulong posId)
    g_posStall[n].peakTime = TimeCurrent();
    g_posStall[n].beDone = false;
    g_posStall[n].partialDone = false;
+   g_posStall[n].lockPeakPts = 0.0;  // отдельный пик для ЗАМКА ПРИБЫЛИ (обновляется каждый тик)
    return n;
 }
 
@@ -913,6 +950,34 @@ void ManageOpenPositions(bool isNewLtfBar)
          }
       }
 
+      // --- Замок прибыли (каждый тик, приоритетнее БУ/трейлинга) ---
+      // Закрывает В ПЛЮСЕ при откате от пика прибыли, чтобы разворот не съел
+      // профит и не увёл в стоп. См. пояснение у InpUseProfitLock.
+      if(InpUseProfitLock)
+      {
+         ENUM_POSITION_TYPE ptype = posInfo.PositionType();
+         double popen = posInfo.PriceOpen();
+         double pbid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+         double pask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+         double profNow = (ptype == POSITION_TYPE_BUY) ? (pbid - popen) / point : (popen - pask) / point;
+
+         int lIdx = GetOrCreateStall(posId);
+         if(profNow > g_posStall[lIdx].lockPeakPts) g_posStall[lIdx].lockPeakPts = profNow;
+
+         if(g_posStall[lIdx].lockPeakPts >= InpProfitLockActivatePts)
+         {
+            double floorPts = MathMax(InpProfitLockFloorPts, g_posStall[lIdx].lockPeakPts - InpProfitLockGiveBackPts);
+            if(profNow <= floorPts)
+            {
+               if(trade.PositionClose(ticket))
+                  Print("🔐 Замок прибыли: тикет ", ticket, " закрыт на +", DoubleToString(profNow, 0),
+                        "пт (пик +", DoubleToString(g_posStall[lIdx].lockPeakPts, 0),
+                        ", пол +", DoubleToString(floorPts, 0), ")");
+               continue;
+            }
+         }
+      }
+
       // --- Безубыток / частичное закрытие / трейлинг (перенесено из v4.9) ---
       {
          ENUM_POSITION_TYPE type = posInfo.PositionType();
@@ -1359,6 +1424,19 @@ int OnInit()
       Print("❌ ERROR: InpStallUpperRefPts должен быть > InpMinTPPts, InpStallMin/MaxMinutes должны быть > 0");
       return INIT_PARAMETERS_INCORRECT;
    }
+   if(InpUseProfitLock)
+   {
+      if(InpProfitLockFloorPts <= 0.0 || InpProfitLockGiveBackPts <= 0.0)
+      {
+         Print("❌ ERROR: InpProfitLockFloorPts и InpProfitLockGiveBackPts должны быть > 0");
+         return INIT_PARAMETERS_INCORRECT;
+      }
+      if(InpProfitLockActivatePts < InpProfitLockFloorPts)
+      {
+         Print("❌ ERROR: InpProfitLockActivatePts должен быть ≥ InpProfitLockFloorPts (нельзя защитить пол выше пика активации)");
+         return INIT_PARAMETERS_INCORRECT;
+      }
+   }
    if(InpUseBreakEven && (InpBreakEvenTriggerPts <= 0 || InpBreakEvenLockPts <= 0))
    {
       Print("❌ ERROR: InpBreakEvenTriggerPts и InpBreakEvenLockPts должны быть > 0");
@@ -1449,6 +1527,10 @@ int OnInit()
    Print("Безубыток: ", (InpUseBreakEven ? "ON" : "OFF"),
          " | Частичное закрытие: ", (InpUsePartialClose ? "ON" : "OFF"),
          " | Трейлинг: ", (InpUseTrailingStop ? "ON" : "OFF"));
+   if(InpUseProfitLock)
+      Print("Замок прибыли: активация +", DoubleToString(InpProfitLockActivatePts, 0),
+            "пт, отдаём max ", DoubleToString(InpProfitLockGiveBackPts, 0),
+            "пт от пика, пол +", DoubleToString(InpProfitLockFloorPts, 0), "пт");
    if(InpRequireMomentumAgree)
       Print("Согласие импульса: вход отменяется без перевеса свечей (бычьих/медвежьих) ",
             "за направление сделки среди последних ", InpMomentumLookback, " M5-свечей");

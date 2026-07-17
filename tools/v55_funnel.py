@@ -34,6 +34,8 @@ SIDEWAYS_PAUSE_MIN = 45
 MIN_TP, MAX_TP, MAX_SL, SL_BUF = 50, 1000, 2500, 50
 TP_OPP_PCT = 80.0
 MAX_HOLD_BARS = 6      # 90 min / 15
+STALL_MAX_MIN = 12     # faster banking of small profit (was 30)
+LOCK_ACTIVATE, LOCK_GIVEBACK, LOCK_FLOOR = 70, 25, 50  # profit-lock
 EOD_H, EOD_M = 22, 0
 
 FUNNEL_KEYS = ["bars_in_window", "after_pause", "have_h4_range", "width_ok",
@@ -73,19 +75,36 @@ def run(date_from=None, date_to=None, label=""):
 
         # --- manage open position on this bar (rough) ---
         if open_pos is not None:
-            hit_sl = (lows[i] <= open_pos['sl']) if open_pos['d'] == 1 else (highs[i] >= open_pos['sl'])
-            hit_tp = (highs[i] >= open_pos['tp']) if open_pos['d'] == 1 else (lows[i] <= open_pos['tp'])
+            d = open_pos['d']
+            hit_sl = (lows[i] <= open_pos['sl']) if d == 1 else (highs[i] >= open_pos['sl'])
+            hit_tp = (highs[i] >= open_pos['tp']) if d == 1 else (lows[i] <= open_pos['tp'])
             eod = (t.hour, t.minute) >= (EOD_H, EOD_M)
             timeout = (i - open_pos['i']) >= MAX_HOLD_BARS
-            if hit_sl:
+            # profit-lock (bar-resolution approximation): lock peak was set from
+            # PRIOR bars; if activated and this bar trades back to the floor,
+            # bank at the floor before SL/timeout can act.
+            lp = open_pos.get('lockpeak', 0.0)
+            locked = False
+            if lp >= LOCK_ACTIVATE:
+                floor = max(LOCK_FLOOR, lp - LOCK_GIVEBACK)
+                floor_price = open_pos['entry'] + floor * POINT * d
+                reached_floor = (lows[i] <= floor_price) if d == 1 else (highs[i] >= floor_price)
+                if reached_floor and not hit_tp:
+                    trades.append(dict(t=t, d=d, exit='LOCK', pts=floor)); open_pos = None; locked = True
+            if locked:
+                pass
+            elif hit_sl:
                 pnl = -abs(open_pos['entry'] - open_pos['sl']) / POINT
                 trades.append(dict(t=t, d=open_pos['d'], exit='SL', pts=pnl)); open_pos = None
             elif hit_tp:
                 pnl = abs(open_pos['tp'] - open_pos['entry']) / POINT
                 trades.append(dict(t=t, d=open_pos['d'], exit='TP', pts=pnl)); open_pos = None
             elif eod or timeout:
-                pnl = (closes[i] - open_pos['entry']) / POINT * open_pos['d']
-                trades.append(dict(t=t, d=open_pos['d'], exit='EOD' if eod else 'TIME', pts=pnl)); open_pos = None
+                pnl = (closes[i] - open_pos['entry']) / POINT * d
+                trades.append(dict(t=t, d=d, exit='EOD' if eod else 'TIME', pts=pnl)); open_pos = None
+            if open_pos is not None:
+                fav = (highs[i] - open_pos['entry']) / POINT if d == 1 else (open_pos['entry'] - lows[i]) / POINT
+                open_pos['lockpeak'] = max(open_pos.get('lockpeak', 0.0), fav)
 
         # --- H4 recalc on each new completed H4 bar ---
         h4_idx = np.searchsorted(h4_times, np.datetime64(t)) - 1
@@ -239,7 +258,7 @@ def run(date_from=None, date_to=None, label=""):
             sl = min(entry + MAX_SL * POINT, res['hi'] + SL_BUF * POINT)
             tp_pts = min(MAX_TP, max(MIN_TP, (entry - sup['hi']) / POINT * TP_OPP_PCT / 100.0))
             tp = entry - tp_pts * POINT
-        open_pos = dict(d=brk, entry=entry, sl=sl, tp=tp, i=i + 1)
+        open_pos = dict(d=brk, entry=entry, sl=sl, tp=tp, i=i + 1, lockpeak=0.0)
         funnel["TRADES"] += 1
 
     print(f"\n===== {label} =====")
