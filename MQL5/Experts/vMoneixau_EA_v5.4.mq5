@@ -879,7 +879,7 @@ bool InSessionWindow()
    if(InpSkipFirstCandle)
    {
       datetime todayStart = StringToTime(StringFormat("%04d.%02d.%02d 00:00", dt.year, dt.mon, dt.day));
-      datetime sessionStart = todayStart + startHM * 60;
+      datetime sessionStart = (datetime)(todayStart + startHM * 60);
       datetime curBarTime = iTime(_Symbol, PERIOD_M5, 0);
       if(curBarTime <= sessionStart) return false; // это первая (или ещё не наступившая) свеча окна
    }
@@ -1671,7 +1671,7 @@ void OnTick()
    // когда диапазона нет ВООБЩЕ (реально нечего сканировать).
    if(isNewH4Bar && !g_haveRange)
    {
-      g_scanPauseUntil = TimeCurrent() + (long)InpSidewaysPauseMinutes * 60;
+      g_scanPauseUntil = (datetime)(TimeCurrent() + (long)InpSidewaysPauseMinutes * 60);
       Print("💤 Нет H4-диапазона — пауза сканирования входов на ", InpSidewaysPauseMinutes, " мин");
    }
    g_sidewaysPaused = (TimeCurrent() < g_scanPauseUntil);
