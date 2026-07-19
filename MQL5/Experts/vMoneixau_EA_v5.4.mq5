@@ -27,7 +27,7 @@
 //|  сейчас не выполнено, вместо того чтобы гадать по скриншотам.      |
 //|  Также ослаблены пороги, которые по накопленным данным оказались   |
 //|  главным узким местом: InpZoneProximityPts 400→700,               |
-//|  InpMaxRangeWidthPts 3000→5000, InpSessionWindowMinutes 600→900.  |
+//|  InpRangeWidthCapPts 3000→5000, InpSessionWindowMinutes 600→900.  |
 //+------------------------------------------------------------------+
 //|  Новая, отдельная стратегия (не связана с XAUUSD_TimeStrategy_EA  |
 //|  v4.x/v5.x) — реализация методики, которую вы описали текстом, в  |
@@ -157,10 +157,30 @@
 //|   ошибок, редкие сделки с защищённым плюсом. Реальную частоту и     |
 //|   исполнение замка проверяйте в MT5 Strategy Tester на M5.          |
 //+------------------------------------------------------------------+
-#property copyright   "vMoneixau v5.52 — новая стратегия, требует проверки в тестере"
-#property version     "5.52"
+//+------------------------------------------------------------------+
+//| v5.53 — ПО ИТОГАМ РЕАЛЬНОГО ТЕСТА MT5 (01.06-16.07: 0 сделок,     |
+//| PnL $0): найдена КОРНЕВАЯ причина категорического нуля сделок —    |
+//| MA-фильтр и требование структуры свингов ПРОТИВОРЕЧАТ фейду краёв  |
+//| диапазона:                                                        |
+//|  • ЛОНГ требовал "цена у поддержки (низ)" И "цена ВЫШЕ MA" — но у   |
+//|    низа диапазона цена почти всегда НИЖЕ MA. Взаимоисключающе.     |
+//|  • ШОРТ у верха — зеркально. → ноль входов за весь период.         |
+//| MA-фильтр (InpUseMAFilter) и свинг-структура (InpRequireSwingBias) |
+//| теперь ОТКЛЮЧАЕМЫ и по умолчанию ВЫКЛ. Направление задаёт связка   |
+//| "у какой зоны + M15-подтверждение + пробой M5 + перевес свечей" —  |
+//| она внутренне согласована.                                        |
+//| Также: лимит ширины H4-диапазона ПЕРЕИМЕНОВАН (InpMaxRangeWidthPts |
+//| → InpRangeWidthCapPts), потому что в тестере оставалось СОХРАНЁННОЕ |
+//| старое значение 5000, которое перекрывало новый дефолт 0 и снова   |
+//| резало 70-90% кандидатов. Новое имя → тестер берёт дефолт 0 (выкл).|
+//| ⚠️ В ТЕСТЕРЕ: на вкладке "Входные параметры" сбросьте значения к    |
+//| умолчаниям (или хотя бы InpSessionWindowMinutes и убедитесь, что    |
+//| InpUseMAFilter=false) — MT5 помнит прошлые значения между запусками.|
+//+------------------------------------------------------------------+
+#property copyright   "vMoneixau v5.53 — новая стратегия, требует проверки в тестере"
+#property version     "5.53"
 #property strict
-#property description "vMoneixau v5.52 — редкие точные входы + замок прибыли (мин. +50, защита от разворота) + БУ/частичное/трейлинг/стагнация"
+#property description "vMoneixau v5.53 — фейд-входы без MA-противоречия + замок прибыли (мин. +50) + БУ/частичное/трейлинг/стагнация"
 
 #include <Trade\Trade.mqh>
 #include <Trade\PositionInfo.mqh>
@@ -178,7 +198,7 @@ input group "=== ШАГ 1: ЗОНЫ H4 + СТРУКТУРА СВИНГОВ ==="
 // снизу" в такие периоды часто оказывается СТАРЫМ уровнем за много месяцев —
 // медианная ширина между такими зонами получилась ~7564 пт, а медианное
 // расстояние цены до ближайшей зоны — ~1622 пт (при старом InpZoneProximityPts
-// =150 это почти никогда не срабатывало). Добавлен InpMaxRangeWidthPts —
+// =150 это почти никогда не срабатывало). Добавлен InpRangeWidthCapPts —
 // диапазон засчитывается, только если он ДЕЙСТВИТЕЛЬНО узкий (реальный боковик,
 // а не два случайных далёких уровня). Также расширены InpZoneProximityPts и
 // InpSessionWindowMinutes — раньше они сильно резали и без того редкие сигналы.
@@ -198,7 +218,7 @@ input double  InpZoneProximityPts   = 700;  // насколько близко �
 // отсекал ~73% оставшихся баров — 3-дневный ход золота обычно шире. Смысла в
 // лимите больше нет: TP зажат потолком InpMaxTPPts, SL — InpMaxSLPts, а вход
 // требует близости к краю рамки (InpZoneProximityPts). 0 = проверка выключена.
-input double  InpMaxRangeWidthPts   = 0;    // макс. ширина H4-диапазона, 0 = не проверять (было 5000→12000)
+input double  InpRangeWidthCapPts   = 0;    // макс. ширина H4-диапазона, 0 = не проверять (было 5000→12000)
 input int     InpSwingConfirmCount  = 2;    // сколько последних свинг-хаев/лоу проверяем на направление
 // НАЙДЕНО (funnel-прогон за год): "подтверждённая зона сопротивления СВЕРХУ и
 // поддержки СНИЗУ" существовали одновременно лишь на ~10% баров окна сессии —
@@ -210,6 +230,11 @@ input int     InpSwingConfirmCount  = 2;    // сколько последних
 // всегда. Фильтры bias/MA/M15 при этом работают как обычно.
 input bool    InpUseHLFallbackRange = true;
 input int     InpHLRangeBars        = 18;   // H4-баров для запасной рамки max/min (18 = ~3 дня)
+// Требование структуры свингов (2 HH+2 HL для лонга / 2 LH+2 LL для шорта) —
+// см. пояснение у InpUseMAFilter: тоже редко совпадает с фейдом у поддержки и
+// вносило вклад в "0 сделок". По умолчанию ВЫКЛ; включите, если хотите
+// торговать только по направлению чёткого тренда структуры.
+input bool    InpRequireSwingBias   = false; // требовать подтверждение структурой свингов (по умолч. ВЫКЛ)
 
 input group "=== ШАГ 2: СЕССИЯ И ИНДИКАТОР 'ИМПУЛЬС' ==="
 // ИЗМЕНЕНО (по запросу): раньше InpSessionWindowMinutes=900 (15 часов) — это
@@ -248,8 +273,19 @@ input ENUM_MA_METHOD InpMAMethod    = MODE_SMA;
 // (по умолчанию ВЫКЛ) — при пробое M5-зоны после отскока от поддержки цена
 // как раз успевает вернуться над MA, и это и есть ваш "импульс"; требовать
 // ещё и разворота самой полусотенной средней — значит опаздывать всегда.
-input double  InpMABufferPts        = 20;   // мин. расстояние цены от MA (было 50 — душило входы у зон)
-input bool    InpMARequireSlope     = false; // требовать ещё и наклон MA (было жёстко ON — опаздывает у зон)
+// НАЙДЕНО (РЕАЛЬНЫЙ ТЕСТ MT5 за 01.06-16.07: 0 сделок, PnL $0): MA-фильтр как
+// жёсткое условие ПРОТИВОРЕЧИТ фейду краёв диапазона. Для ЛОНГА нужно
+// g_nearSupport (цена у НИЗА диапазона) И g_maLong (цена ВЫШЕ MA+буфер) — но у
+// низа диапазона цена почти всегда НИЖЕ своей MA(50). Для ШОРТА у верха —
+// наоборот. Оба входа взаимоисключающи → ноль сделок за весь период (это
+// подтвердил и мой годовой прогон, и ваш реальный тестер). MA-фильтр (и
+// требование структуры свингов) теперь ОТКЛЮЧАЕМЫ и по умолчанию ВЫКЛ:
+// направление задаёт связка "у какой зоны + подтверждение M15 + пробой M5 +
+// перевес свечей", которая внутренне согласована. Включайте MA/свинги только
+// если хотите ДОПОЛНИТЕЛЬНО отфильтровать по тренду (сделок станет ещё меньше).
+input bool    InpUseMAFilter        = false; // включить MA-фильтр направления (по умолч. ВЫКЛ — противоречит фейду)
+input double  InpMABufferPts        = 20;   // мин. расстояние цены от MA (если фильтр включён)
+input bool    InpMARequireSlope     = false; // требовать ещё и наклон MA (если фильтр включён)
 input int     InpMASlopeBars        = 5;    // на скольки барах назад сравниваем MA для наклона (если ON)
 
 input group "=== ШАГ 2b: ПОДТВЕРЖДЕНИЕ ЗОН НА M15 (по запросу — 'на 15 минут видно зоны ещё лучше') ==="
@@ -1292,8 +1328,22 @@ void CheckEntry()
    if(!g_haveRange) return;
    if(!g_rangeWidthOk) return; // не реальный боковик, а два далёких старых уровня
 
-   bool wantLong  = g_nearSupport    && (g_swingBias >= 0) && g_maLong  && g_m15ConfirmSupport;
-   bool wantShort = g_nearResistance && (g_swingBias <= 0) && g_maShort && g_m15ConfirmResistance;
+   // Ядро направления (внутренне согласовано): у какой зоны + подтверждение M15.
+   // Пробой M5 (TryLtfBreakout) и перевес свечей (RecentCandlesAgree) проверяются
+   // ниже как ТРИГГЕР и фильтр момента. Свинг-структура и MA — опциональные
+   // трендовые фильтры поверх (по умолчанию ВЫКЛ, см. пояснения у входных).
+   bool wantLong  = g_nearSupport    && g_m15ConfirmSupport;
+   bool wantShort = g_nearResistance && g_m15ConfirmResistance;
+   if(InpRequireSwingBias)
+   {
+      wantLong  = wantLong  && (g_swingBias >= 0);
+      wantShort = wantShort && (g_swingBias <= 0);
+   }
+   if(InpUseMAFilter)
+   {
+      wantLong  = wantLong  && g_maLong;
+      wantShort = wantShort && g_maShort;
+   }
 
    if(!SpreadOK()) return;
    if(!CalendarClear()) return;
@@ -1414,9 +1464,9 @@ int OnInit()
       Print("❌ ERROR: InpMaxSLPts должен быть > 0");
       return INIT_PARAMETERS_INCORRECT;
    }
-   if(InpMaxRangeWidthPts < 0)
+   if(InpRangeWidthCapPts < 0)
    {
-      Print("❌ ERROR: InpMaxRangeWidthPts не может быть отрицательным (0 = проверка выключена)");
+      Print("❌ ERROR: InpRangeWidthCapPts не может быть отрицательным (0 = проверка выключена)");
       return INIT_PARAMETERS_INCORRECT;
    }
    if(InpUseStallExit && (InpStallUpperRefPts <= InpMinTPPts || InpStallMinMinutes <= 0 || InpStallMaxMinutes <= 0))
@@ -1679,8 +1729,8 @@ void OnTick()
    double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
    if(g_haveRange)
    {
-      g_rangeWidthOk   = (InpMaxRangeWidthPts <= 0.0) ||
-                         ((g_curRes.lo - g_curSup.hi) / point <= InpMaxRangeWidthPts);
+      g_rangeWidthOk   = (InpRangeWidthCapPts <= 0.0) ||
+                         ((g_curRes.lo - g_curSup.hi) / point <= InpRangeWidthCapPts);
       g_nearSupport    = (curPrice >= g_curSup.lo) && ((curPrice - g_curSup.hi) / point <= InpZoneProximityPts);
       g_nearResistance = (curPrice <= g_curRes.hi) && ((g_curRes.lo - curPrice) / point <= InpZoneProximityPts);
    }
@@ -1872,10 +1922,10 @@ void DrawPanel()
       colors[n] = InpColorBad; n++;
       texts[n] = StringFormat("Поддержка: %.2f-%.2f (%d кас.)%s", g_curSup.lo, g_curSup.hi, g_curSup.touches, srcTag);
       colors[n] = InpColorGood; n++;
-      if(InpMaxRangeWidthPts > 0.0)
+      if(InpRangeWidthCapPts > 0.0)
       {
          texts[n] = StringFormat("Ширина: %.0fпт %s (лимит %.0f)", widthPts,
-                                  g_rangeWidthOk ? "✅" : "❌ слишком широко", InpMaxRangeWidthPts);
+                                  g_rangeWidthOk ? "✅" : "❌ слишком широко", InpRangeWidthCapPts);
          colors[n] = g_rangeWidthOk ? InpColorGood : InpColorBad; n++;
       }
       else
@@ -1917,8 +1967,10 @@ void DrawPanel()
                             ? StringFormat("⏸ ещё %d мин", (int)MathMax(0, (g_scanPauseUntil - TimeCurrent()) / 60))
                             : "✅ нет паузы");
    colors[n] = g_sidewaysPaused ? InpColorBad : InpColorGood; n++;
-   bool readyLong  = g_haveRange && g_rangeWidthOk && g_nearSupport    && (g_swingBias >= 0) && g_maLong  && g_m15ConfirmSupport    && g_inSession && !g_sidewaysPaused;
-   bool readyShort = g_haveRange && g_rangeWidthOk && g_nearResistance && (g_swingBias <= 0) && g_maShort && g_m15ConfirmResistance && g_inSession && !g_sidewaysPaused;
+   bool readyLong  = g_haveRange && g_rangeWidthOk && g_nearSupport    && g_m15ConfirmSupport    && g_inSession && !g_sidewaysPaused
+                     && (!InpRequireSwingBias || g_swingBias >= 0) && (!InpUseMAFilter || g_maLong);
+   bool readyShort = g_haveRange && g_rangeWidthOk && g_nearResistance && g_m15ConfirmResistance && g_inSession && !g_sidewaysPaused
+                     && (!InpRequireSwingBias || g_swingBias <= 0) && (!InpUseMAFilter || g_maShort);
    if(readyLong || readyShort)
    {
       texts[n] = StringFormat("Все условия ОК (%s) — ждём пробой M5-зоны", readyLong ? "ЛОНГ" : "ШОРТ");

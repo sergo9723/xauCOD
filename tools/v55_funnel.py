@@ -36,6 +36,8 @@ TP_OPP_PCT = 80.0
 MAX_HOLD_BARS = 6      # 90 min / 15
 STALL_MAX_MIN = 12     # faster banking of small profit (was 30)
 LOCK_ACTIVATE, LOCK_GIVEBACK, LOCK_FLOOR = 70, 25, 50  # profit-lock
+USE_MA_FILTER = False      # v5.53: MA filter contradicts fade -> OFF by default
+REQUIRE_SWING_BIAS = False # v5.53: swing-bias requirement -> OFF by default
 EOD_H, EOD_M = 22, 0
 
 FUNNEL_KEYS = ["bars_in_window", "after_pause", "have_h4_range", "width_ok",
@@ -166,8 +168,8 @@ def run(date_from=None, date_to=None, label=""):
             continue
         funnel["near_zone"] += 1
 
-        want_long_side = near_sup and bias >= 0
-        want_short_side = near_res and bias <= 0
+        want_long_side = near_sup and (bias >= 0 if REQUIRE_SWING_BIAS else True)
+        want_short_side = near_res and (bias <= 0 if REQUIRE_SWING_BIAS else True)
         if not (want_long_side or want_short_side):
             continue
         funnel["bias_ok"] += 1
@@ -176,8 +178,11 @@ def run(date_from=None, date_to=None, label=""):
         ma_now, ma_prev = ma[i], ma[i - MA_SLOPE_BARS]
         if np.isnan(ma_now) or np.isnan(ma_prev):
             continue
-        ma_long = cur_p > ma_now + MA_BUFFER_PTS * POINT   # slope requirement removed (v5.5 fix)
-        ma_short = cur_p < ma_now - MA_BUFFER_PTS * POINT
+        if USE_MA_FILTER:
+            ma_long = cur_p > ma_now + MA_BUFFER_PTS * POINT
+            ma_short = cur_p < ma_now - MA_BUFFER_PTS * POINT
+        else:
+            ma_long = ma_short = True   # MA filter OFF (v5.53): fade carries direction
         want_long = want_long_side and ma_long
         want_short = want_short_side and ma_short
         if not (want_long or want_short):
